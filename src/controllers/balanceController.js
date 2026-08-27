@@ -1,0 +1,4 @@
+import { DerivAccount } from "../models/DerivAccount.js";import { decrypt } from "../utils/crypto.js";import { derivBalanceService } from "../services/DerivBalanceService.js";import { AppError } from "../utils/AppError.js";
+async function current(userId){const a=await DerivAccount.findOne({userId,selected:true,accountType:"real"}).select("+encryptedAccessToken");if(!a)throw new AppError("No selected real Deriv account",404,"REAL_ACCOUNT_REQUIRED");return a}
+export async function getBalance(req,res){const a=await current(req.user.id);const token=decrypt(a.encryptedAccessToken);const b=await derivBalanceService.get(a.derivAccountId,token,{subscribe:true});res.json({success:true,data:{balance:Number(b.balance),currency:b.currency,accountId:a.derivAccountId,accountType:"real",source:"deriv",updatedAt:new Date().toISOString()}})}
+export async function refreshBalance(req,res){return getBalance(req,res)}

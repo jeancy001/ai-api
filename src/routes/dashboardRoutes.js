@@ -1,0 +1,1 @@
+import { Router } from "express";import { auth } from "../middleware/auth.js";import { asyncHandler } from "../utils/asyncHandler.js";import { dashboard } from "../controllers/dashboardController.js";const r=Router();r.get("/",auth,asyncHandler(dashboard));export default r;
