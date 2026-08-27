@@ -25,10 +25,10 @@ function getUserId(req) {
 }
 
 /**
- * Get the selected, connected, verified real Deriv account.
+ * Get the selected, connected, verified REAL Deriv account.
  *
- * The encrypted access token is explicitly selected because it
- * should normally be excluded from API queries and responses.
+ * MongoDB is used only for account ownership, connection metadata,
+ * and the encrypted credential. It is NOT used as the balance source.
  */
 async function getSelectedRealAccount(userId) {
   const account = await DerivAccount.findOne({
@@ -59,11 +59,22 @@ async function getSelectedRealAccount(userId) {
     );
   }
 
-  if (!account.encryptedAccessToken) {
+  if (
+    typeof account.encryptedAccessToken !== "string" ||
+    account.encryptedAccessToken.trim().length === 0
+  ) {
     throw new AppError(
       "The selected Deriv account does not have valid credentials. Please reconnect your account.",
       401,
       "DERIV_TOKEN_MISSING"
+    );
+  }
+
+  if (!account.derivAccountId) {
+    throw new AppError(
+      "The selected Deriv account is missing its account ID. Please reconnect your account.",
+      400,
+      "DERIV_ACCOUNT_ID_MISSING"
     );
   }
 
@@ -73,7 +84,7 @@ async function getSelectedRealAccount(userId) {
 /**
  * Decrypt the Deriv access token safely.
  *
- * Never return the token or include it in logs.
+ * The token must never be returned to the client or written to logs.
  */
 function getAccessToken(account) {
   try {
@@ -81,12 +92,15 @@ function getAccessToken(account) {
       account.encryptedAccessToken
     );
 
-    if (!token) {
+    if (
+      typeof token !== "string" ||
+      token.trim().length === 0
+    ) {
       throw new Error("Empty access token");
     }
 
-    return token;
-  } catch (error) {
+    return token.trim();
+  } catch {
     throw new AppError(
       "Unable to access Deriv credentials. Please reconnect your Deriv account.",
       401,
@@ -96,65 +110,113 @@ function getAccessToken(account) {
 }
 
 /**
- * Build a consistent balance response.
+ * Build a response exclusively from the LIVE Deriv response.
+ *
+ * IMPORTANT:
+ * There is intentionally no fallback to account.lastKnownBalance,
+ * account.balance, or any other MongoDB balance field.
  */
-function serializeBalance(account, balance, source) {
-  if (!balance) {
+function serializeLiveBalance(account, liveBalance) {
+  if (
+    !liveBalance ||
+    typeof liveBalance !== "object"
+  ) {
     throw new AppError(
-      "Deriv did not return account balance information",
+      "Deriv did not return live account balance information",
       502,
-      "DERIV_BALANCE_UNAVAILABLE"
+      "DERIV_LIVE_BALANCE_UNAVAILABLE"
     );
   }
 
-  const amount = Number(balance.balance);
+  const amount = Number(
+    liveBalance.balance
+  );
 
   if (!Number.isFinite(amount)) {
     throw new AppError(
-      "Deriv returned an invalid balance",
+      "Deriv returned an invalid live balance",
       502,
-      "DERIV_INVALID_BALANCE"
+      "DERIV_LIVE_BALANCE_INVALID"
+    );
+  }
+
+  /**
+   * The balance service should already validate this. We verify again
+   * at the controller boundary as defense in depth.
+   */
+  const responseAccountId =
+    liveBalance.accountId ||
+    liveBalance.loginid ||
+    liveBalance.account_id ||
+    null;
+
+  if (
+    responseAccountId &&
+    String(responseAccountId) !==
+      String(account.derivAccountId)
+  ) {
+    throw new AppError(
+      "Live balance was returned for a different Deriv account",
+      403,
+      "DERIV_BALANCE_ACCOUNT_MISMATCH"
     );
   }
 
   return {
     balance: amount,
+
+    /**
+     * Prefer the currency from the live Deriv response.
+     * Account metadata is only used when Deriv does not include currency.
+     */
     currency:
-      balance.currency ||
+      liveBalance.currency ||
       account.currency ||
       null,
 
-    accountId: account.derivAccountId,
-    derivAccountId: account.derivAccountId,
+    accountId: String(
+      account.derivAccountId
+    ),
+    derivAccountId: String(
+      account.derivAccountId
+    ),
     accountType: account.accountType,
 
-    source,
-    updatedAt: new Date().toISOString(),
+    /**
+     * Explicit proof for the frontend that this is not a cached balance.
+     */
+    source: "deriv_live",
+
+    updatedAt:
+      liveBalance.updatedAt ||
+      new Date().toISOString(),
   };
 }
 
 /**
- * Fetch the current balance from Deriv.
+ * Fetch the CURRENT LIVE balance from Deriv.
+ *
+ * Flow:
+ * MongoDB -> selected account + encrypted token
+ * Decrypt token
+ * Deriv -> LIVE balance
+ *
+ * MongoDB is never queried for the balance itself.
  */
-async function fetchDerivBalance(userId) {
+async function fetchLiveDerivBalance(userId) {
   const account =
     await getSelectedRealAccount(userId);
 
   const accessToken =
     getAccessToken(account);
 
-  /**
-   * For a normal HTTP request we do NOT subscribe.
-   *
-   * A persistent subscription is useful for a WebSocket-powered
-   * dashboard or the auto-trading engine, but an HTTP GET should
-   * simply fetch the current balance.
-   */
   const balance =
     await derivBalanceService.get(
-      account.derivAccountId,
+      String(account.derivAccountId),
       accessToken,
-      { subscribe: false }
+      {
+        subscribe: false,
+      }
     );
 
   return {
@@ -166,21 +228,19 @@ async function fetchDerivBalance(userId) {
 /**
  * GET /account/deriv/balance
  *
- * Get the current balance. The service may also update the cached
- * balance in MongoDB as part of its normal persistence behavior.
+ * Always fetches the current balance directly from Deriv.
  */
 export async function getBalance(req, res) {
   const userId = getUserId(req);
 
   const { account, balance } =
-    await fetchDerivBalance(userId);
+    await fetchLiveDerivBalance(userId);
 
   return res.status(200).json({
     success: true,
-    data: serializeBalance(
+    data: serializeLiveBalance(
       account,
-      balance,
-      "deriv"
+      balance
     ),
   });
 }
@@ -188,36 +248,44 @@ export async function getBalance(req, res) {
 /**
  * POST /account/deriv/balance/refresh
  *
- * Explicitly refresh the balance directly from Deriv.
+ * Explicitly requests the latest balance directly from Deriv.
+ *
+ * This endpoint is functionally also live; it exists separately so
+ * the frontend can expose a dedicated refresh action.
  */
 export async function refreshBalance(req, res) {
   const userId = getUserId(req);
 
   const { account, balance } =
-    await fetchDerivBalance(userId);
+    await fetchLiveDerivBalance(userId);
 
-  await logActivitySafe({
+  /**
+   * Activity logging is best-effort and must never affect the live
+   * balance response.
+   */
+  logActivitySafe({
     userId,
     type: "DERIV_BALANCE_REFRESHED",
     title: "Deriv balance refreshed",
     description:
-      "The selected Deriv account balance was refreshed successfully.",
+      "The selected Deriv account balance was refreshed directly from Deriv.",
     metadata: {
-      accountId: account.derivAccountId,
+      accountId: String(account.derivAccountId),
+      source: "deriv_live",
       currency:
         balance?.currency ||
         account.currency ||
         null,
     },
-  });
+  }).catch?.(() => {});
 
   return res.status(200).json({
     success: true,
-    message: "Balance refreshed successfully",
-    data: serializeBalance(
+    message:
+      "Live balance refreshed successfully",
+    data: serializeLiveBalance(
       account,
-      balance,
-      "deriv"
+      balance
     ),
   });
 }
