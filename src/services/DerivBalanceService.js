@@ -5,34 +5,25 @@ import { AppError } from "../utils/AppError.js";
 /**
  * DerivBalanceService
  *
- * SOURCE OF TRUTH:
- * - Deriv is always the source of truth for account balances.
+ * LIVE BALANCE SOURCE OF TRUTH:
+ * Deriv is the only source of truth for the current account balance.
  *
- * Responsibilities:
- * - Retrieve the current balance directly from Deriv.
- * - Optionally subscribe to live balance updates.
- * - Optionally persist the latest observed balance for informational
- *   and operational purposes only.
- *
- * IMPORTANT:
- * MongoDB is NEVER used as a fallback for a live balance request.
- * If Deriv cannot provide a live balance, this service throws an error.
+ * MongoDB may store the last balance observed from Deriv for diagnostics,
+ * but MongoDB is NEVER read by get() and is NEVER used as a fallback for
+ * live balance requests or real-money trading decisions.
  */
 export class DerivBalanceService {
   constructor() {
     /**
-     * Persist balance updates received through the persistent Deriv
-     * WebSocket connection.
-     *
-     * Persistence is best-effort only. A MongoDB failure must not change
-     * the fact that the live balance was received from Deriv.
+     * Balance events received from the persistent Deriv connection are
+     * persisted only as informational/operational history.
      */
     derivConnectionManager.on(
       "balance",
       (accountId, balance) => {
         this.persist(accountId, balance).catch((error) => {
           console.error(
-            "Failed to persist Deriv balance update:",
+            "Failed to persist observed Deriv balance:",
             error?.message || error
           );
         });
@@ -41,10 +32,62 @@ export class DerivBalanceService {
   }
 
   /**
+   * Normalize an account ID safely.
+   */
+  normalizeAccountId(accountId) {
+    return String(accountId || "").trim();
+  }
+
+  /**
+   * Extract the balance payload from the actual Deriv/connection-manager
+   * response without inventing or estimating any values.
+   */
+  extractBalancePayload(message) {
+    if (!message || typeof message !== "object") {
+      return null;
+    }
+
+    // Standard Deriv WebSocket response:
+    // { balance: { balance, currency, loginid, ... } }
+    if (
+      message.balance &&
+      typeof message.balance === "object" &&
+      !Array.isArray(message.balance)
+    ) {
+      return message.balance;
+    }
+
+    // Some wrappers return:
+    // { data: { balance: { ... } } }
+    if (
+      message.data &&
+      typeof message.data === "object" &&
+      !Array.isArray(message.data)
+    ) {
+      const data = message.data;
+
+      if (
+        data.balance &&
+        typeof data.balance === "object" &&
+        !Array.isArray(data.balance)
+      ) {
+        return data.balance;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Get the CURRENT LIVE balance directly from Deriv.
    *
-   * This method always makes a request to Deriv. It does not read or
-   * return a cached MongoDB balance.
+   * This method:
+   * 1. Validates the selected account and credentials provided by the caller.
+   * 2. Sends a balance request directly to Deriv.
+   * 3. Validates the account identity returned by Deriv when available.
+   * 4. Returns only data obtained from the live Deriv response.
+   *
+   * MongoDB is NOT queried for the balance.
    *
    * @param {string} accountId
    * @param {string} accessToken
@@ -57,9 +100,7 @@ export class DerivBalanceService {
     { subscribe = false } = {}
   ) {
     const normalizedAccountId =
-      typeof accountId === "string"
-        ? accountId.trim()
-        : String(accountId || "").trim();
+      this.normalizeAccountId(accountId);
 
     const normalizedAccessToken =
       typeof accessToken === "string"
@@ -82,10 +123,6 @@ export class DerivBalanceService {
       );
     }
 
-    /**
-     * This request is sent directly to Deriv through the authenticated
-     * WebSocket connection. No MongoDB balance is involved.
-     */
     const payload = {
       balance: 1,
     };
@@ -97,6 +134,10 @@ export class DerivBalanceService {
     let message;
 
     try {
+      /**
+       * This must send the request through an authenticated Deriv
+       * connection associated with this exact account/token.
+       */
       message = await derivConnectionManager.request(
         normalizedAccountId,
         normalizedAccessToken,
@@ -109,33 +150,16 @@ export class DerivBalanceService {
 
       throw new AppError(
         error?.message ||
-          "Unable to retrieve live balance from Deriv",
+          "Unable to retrieve the live balance from Deriv",
         502,
         "DERIV_LIVE_BALANCE_REQUEST_FAILED"
       );
     }
 
-    /**
-     * Deriv's response should contain:
-     *
-     * {
-     *   balance: {
-     *     balance: "...",
-     *     currency: "...",
-     *     loginid: "..."
-     *   }
-     * }
-     *
-     * Check explicitly for null/undefined so a valid zero balance
-     * is not treated as an invalid response.
-     */
-    const liveBalance = message?.balance;
+    const liveBalance =
+      this.extractBalancePayload(message);
 
-    if (
-      liveBalance === null ||
-      liveBalance === undefined ||
-      typeof liveBalance !== "object"
-    ) {
+    if (!liveBalance) {
       throw new AppError(
         "Deriv did not return live account balance data",
         502,
@@ -143,9 +167,27 @@ export class DerivBalanceService {
       );
     }
 
-    const numericBalance = Number(
-      liveBalance.balance
-    );
+    /**
+     * Do not use `|| 0` here.
+     *
+     * A missing balance and an actual balance of zero are completely
+     * different situations.
+     */
+    const rawBalance = liveBalance.balance;
+
+    if (
+      rawBalance === null ||
+      rawBalance === undefined ||
+      rawBalance === ""
+    ) {
+      throw new AppError(
+        "Deriv did not return a balance value",
+        502,
+        "DERIV_LIVE_BALANCE_MISSING"
+      );
+    }
+
+    const numericBalance = Number(rawBalance);
 
     if (!Number.isFinite(numericBalance)) {
       throw new AppError(
@@ -156,18 +198,19 @@ export class DerivBalanceService {
     }
 
     /**
-     * Security check: when Deriv identifies the account in its response,
-     * make sure the response belongs to the account we requested.
+     * Deriv commonly identifies the account as `loginid`.
+     * Validate it whenever it is present.
      */
     const responseAccountId =
       liveBalance.loginid ||
       liveBalance.account_id ||
       liveBalance.accountId ||
+      liveBalance.login_id ||
       null;
 
     if (
       responseAccountId &&
-      String(responseAccountId) !==
+      String(responseAccountId).trim() !==
         normalizedAccountId
     ) {
       throw new AppError(
@@ -177,43 +220,43 @@ export class DerivBalanceService {
       );
     }
 
+    /**
+     * This object is built exclusively from the live Deriv response.
+     */
     const result = {
-      ...liveBalance,
-
-      /**
-       * Normalize the amount to a number for the API/frontend.
-       */
       balance: numericBalance,
 
       currency:
-        liveBalance.currency || null,
+        typeof liveBalance.currency === "string" &&
+        liveBalance.currency.trim()
+          ? liveBalance.currency.trim().toUpperCase()
+          : null,
 
-      accountId:
-        String(
-          responseAccountId ||
-          normalizedAccountId
-        ),
+      accountId: String(
+        responseAccountId || normalizedAccountId
+      ),
 
-      /**
-       * Explicitly identify where this balance came from.
-       */
+      derivAccountId: String(
+        responseAccountId || normalizedAccountId
+      ),
+
       source: "deriv_live",
 
       updatedAt: new Date().toISOString(),
     };
 
     /**
-     * Best-effort persistence.
+     * Optional best-effort persistence.
      *
-     * We intentionally do not await persistence before returning the
-     * live balance. MongoDB is not part of the source-of-truth path.
+     * This is deliberately asynchronous and cannot affect the live
+     * response returned to the caller.
      */
     this.persist(
       normalizedAccountId,
       result
     ).catch((error) => {
       console.error(
-        "Failed to persist live Deriv balance:",
+        "Failed to persist observed live Deriv balance:",
         error?.message || error
       );
     });
@@ -222,31 +265,33 @@ export class DerivBalanceService {
   }
 
   /**
-   * Persist an observed balance from Deriv.
+   * Persist a balance that was already received from Deriv.
    *
-   * IMPORTANT:
-   * This data is informational only and must never be used as a fallback
-   * for get(). A failure here does not affect live trading data.
+   * This is NOT part of the live balance source-of-truth path.
    */
   async persist(accountId, balance) {
     const normalizedAccountId =
-      String(accountId || "").trim();
+      this.normalizeAccountId(accountId);
+
+    if (!normalizedAccountId || !balance) {
+      return null;
+    }
+
+    const rawBalance = balance.balance;
 
     if (
-      !normalizedAccountId ||
-      !balance
+      rawBalance === null ||
+      rawBalance === undefined ||
+      rawBalance === ""
     ) {
       return null;
     }
 
-    const numericBalance = Number(
-      balance.balance
-    );
+    const numericBalance = Number(rawBalance);
 
     if (!Number.isFinite(numericBalance)) {
       console.warn(
-        "Ignoring invalid Deriv balance value:",
-        balance.balance
+        "Ignoring invalid observed Deriv balance value"
       );
 
       return null;
@@ -258,17 +303,16 @@ export class DerivBalanceService {
       connectionStatus: "connected",
     };
 
-    if (balance.currency) {
-      update.currency = String(
-        balance.currency
-      );
+    if (
+      typeof balance.currency === "string" &&
+      balance.currency.trim()
+    ) {
+      update.currency =
+        balance.currency.trim().toUpperCase();
     }
 
     /**
-     * Never upsert from a balance event.
-     *
-     * The account must already have been verified and connected through
-     * the OAuth/account connection flow.
+     * Never create an account document from a balance response.
      */
     return DerivAccount.updateOne(
       {
@@ -282,14 +326,13 @@ export class DerivBalanceService {
   }
 
   /**
-   * Optional diagnostic/history method.
+   * Diagnostic/history method only.
    *
-   * This method is deliberately NOT used by get() and must not be used
-   * by real-money trade approval or as a live balance fallback.
+   * NEVER use this as a fallback for get() or for approving a live trade.
    */
   async getLastKnown(accountId) {
     const normalizedAccountId =
-      String(accountId || "").trim();
+      this.normalizeAccountId(accountId);
 
     if (!normalizedAccountId) {
       return null;

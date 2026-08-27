@@ -4,9 +4,10 @@ import { derivBalanceService } from "../services/DerivBalanceService.js";
 import { AppError } from "../utils/AppError.js";
 import { logActivitySafe } from "../services/ActivityService.js";
 
-/**
- * Get the authenticated user ID consistently.
- */
+/* ============================================================
+   AUTHENTICATED USER
+============================================================ */
+
 function getUserId(req) {
   const userId =
     req.user?.id ||
@@ -24,12 +25,17 @@ function getUserId(req) {
   return String(userId);
 }
 
-/**
- * Get the selected, connected, verified REAL Deriv account.
- *
- * MongoDB is used only for account ownership, connection metadata,
- * and the encrypted credential. It is NOT used as the balance source.
- */
+/* ============================================================
+   SELECTED REAL DERIV ACCOUNT
+
+   MongoDB is used ONLY for:
+   - verifying account ownership
+   - determining the selected account
+   - storing encrypted credentials
+
+   MongoDB is NEVER used as the balance source.
+============================================================ */
+
 async function getSelectedRealAccount(userId) {
   const account = await DerivAccount.findOne({
     userId,
@@ -39,7 +45,7 @@ async function getSelectedRealAccount(userId) {
 
   if (!account) {
     throw new AppError(
-      "No selected and connected Deriv account was found",
+      "No selected and connected REAL Deriv account was found",
       404,
       "DERIV_ACCOUNT_NOT_SELECTED"
     );
@@ -53,15 +59,27 @@ async function getSelectedRealAccount(userId) {
 
   if (accountType !== "real") {
     throw new AppError(
-      "The selected Deriv account is not a verified real account",
+      "A selected REAL Deriv account is required",
       403,
       "REAL_ACCOUNT_REQUIRED"
     );
   }
 
+  const derivAccountId = String(
+    account.derivAccountId || ""
+  ).trim();
+
+  if (!derivAccountId) {
+    throw new AppError(
+      "The selected Deriv account is missing its account ID. Please reconnect your account.",
+      400,
+      "DERIV_ACCOUNT_ID_MISSING"
+    );
+  }
+
   if (
     typeof account.encryptedAccessToken !== "string" ||
-    account.encryptedAccessToken.trim().length === 0
+    !account.encryptedAccessToken.trim()
   ) {
     throw new AppError(
       "The selected Deriv account does not have valid credentials. Please reconnect your account.",
@@ -70,22 +88,13 @@ async function getSelectedRealAccount(userId) {
     );
   }
 
-  if (!account.derivAccountId) {
-    throw new AppError(
-      "The selected Deriv account is missing its account ID. Please reconnect your account.",
-      400,
-      "DERIV_ACCOUNT_ID_MISSING"
-    );
-  }
-
   return account;
 }
 
-/**
- * Decrypt the Deriv access token safely.
- *
- * The token must never be returned to the client or written to logs.
- */
+/* ============================================================
+   DERIV ACCESS TOKEN
+============================================================ */
+
 function getAccessToken(account) {
   try {
     const token = decrypt(
@@ -94,9 +103,9 @@ function getAccessToken(account) {
 
     if (
       typeof token !== "string" ||
-      token.trim().length === 0
+      !token.trim()
     ) {
-      throw new Error("Empty access token");
+      throw new Error("Invalid access token");
     }
 
     return token.trim();
@@ -109,28 +118,49 @@ function getAccessToken(account) {
   }
 }
 
-/**
- * Build a response exclusively from the LIVE Deriv response.
- *
- * IMPORTANT:
- * There is intentionally no fallback to account.lastKnownBalance,
- * account.balance, or any other MongoDB balance field.
- */
+/* ============================================================
+   SERIALIZE VERIFIED LIVE DERIV BALANCE
+
+   IMPORTANT:
+   - Zero is valid ONLY if Deriv explicitly returns zero.
+   - Missing balance is an error.
+   - No MongoDB balance field is ever read here.
+============================================================ */
+
 function serializeLiveBalance(account, liveBalance) {
   if (
     !liveBalance ||
     typeof liveBalance !== "object"
   ) {
     throw new AppError(
-      "Deriv did not return live account balance information",
+      "Deriv did not return live balance information",
       502,
       "DERIV_LIVE_BALANCE_UNAVAILABLE"
     );
   }
 
-  const amount = Number(
-    liveBalance.balance
-  );
+  const rawBalance = liveBalance.balance;
+
+  /*
+   * Do NOT do:
+   *
+   * Number(rawBalance || 0)
+   *
+   * because a missing balance would incorrectly become $0.00.
+   */
+  if (
+    rawBalance === undefined ||
+    rawBalance === null ||
+    rawBalance === ""
+  ) {
+    throw new AppError(
+      "Deriv did not return a balance for the selected account",
+      502,
+      "DERIV_LIVE_BALANCE_MISSING"
+    );
+  }
+
+  const amount = Number(rawBalance);
 
   if (!Number.isFinite(amount)) {
     throw new AppError(
@@ -140,69 +170,91 @@ function serializeLiveBalance(account, liveBalance) {
     );
   }
 
-  /**
-   * The balance service should already validate this. We verify again
-   * at the controller boundary as defense in depth.
+  /*
+   * Deriv's Balance API identifies the authorized account with
+   * loginid. Our service may normalize it as accountId.
    */
   const responseAccountId =
-    liveBalance.accountId ||
-    liveBalance.loginid ||
-    liveBalance.account_id ||
+    liveBalance.accountId ??
+    liveBalance.loginid ??
+    liveBalance.loginId ??
+    liveBalance.account_id ??
     null;
 
+  /*
+   * Security check: never display a balance belonging to another
+   * Deriv account.
+   */
   if (
-    responseAccountId &&
-    String(responseAccountId) !==
-      String(account.derivAccountId)
+    responseAccountId !== null &&
+    String(responseAccountId).trim() !==
+      String(account.derivAccountId).trim()
   ) {
     throw new AppError(
-      "Live balance was returned for a different Deriv account",
+      "Deriv returned balance information for a different account",
       403,
       "DERIV_BALANCE_ACCOUNT_MISMATCH"
     );
   }
 
+  const currency =
+    typeof liveBalance.currency === "string" &&
+    liveBalance.currency.trim()
+      ? liveBalance.currency.trim().toUpperCase()
+      : typeof account.currency === "string" &&
+          account.currency.trim()
+        ? account.currency.trim().toUpperCase()
+        : null;
+
   return {
+    /*
+     * This amount comes directly from Deriv.
+     */
     balance: amount,
 
-    /**
-     * Prefer the currency from the live Deriv response.
-     * Account metadata is only used when Deriv does not include currency.
+    currency,
+
+    /*
+     * Explicitly return the verified account.
      */
-    currency:
-      liveBalance.currency ||
-      account.currency ||
-      null,
+    accountId: String(account.derivAccountId),
+    derivAccountId: String(account.derivAccountId),
 
-    accountId: String(
-      account.derivAccountId
-    ),
-    derivAccountId: String(
-      account.derivAccountId
-    ),
-    accountType: account.accountType,
+    /*
+     * This controller only permits real accounts.
+     */
+    accountType: "real",
 
-    /**
-     * Explicit proof for the frontend that this is not a cached balance.
+    /*
+     * Allows the frontend to clearly identify the source.
      */
     source: "deriv_live",
 
     updatedAt:
-      liveBalance.updatedAt ||
-      new Date().toISOString(),
+      typeof liveBalance.updatedAt === "string"
+        ? liveBalance.updatedAt
+        : new Date().toISOString(),
   };
 }
 
-/**
- * Fetch the CURRENT LIVE balance from Deriv.
- *
- * Flow:
- * MongoDB -> selected account + encrypted token
- * Decrypt token
- * Deriv -> LIVE balance
- *
- * MongoDB is never queried for the balance itself.
- */
+/* ============================================================
+   FETCH CURRENT LIVE BALANCE FROM DERIV
+
+   Flow:
+
+   MongoDB
+      ↓
+   selected REAL account + encrypted token
+      ↓
+   decrypt token server-side
+      ↓
+   Deriv Balance API / authenticated WebSocket
+      ↓
+   verified live balance
+
+   MongoDB balance fields are NEVER read.
+============================================================ */
+
 async function fetchLiveDerivBalance(userId) {
   const account =
     await getSelectedRealAccount(userId);
@@ -219,73 +271,86 @@ async function fetchLiveDerivBalance(userId) {
       }
     );
 
+  if (!balance) {
+    throw new AppError(
+      "Deriv did not return the current account balance",
+      502,
+      "DERIV_LIVE_BALANCE_UNAVAILABLE"
+    );
+  }
+
   return {
     account,
     balance,
   };
 }
 
-/**
- * GET /account/deriv/balance
- *
- * Always fetches the current balance directly from Deriv.
- */
+/* ============================================================
+   GET CURRENT LIVE BALANCE
+
+   GET /api/v1/account/deriv/balance
+============================================================ */
+
 export async function getBalance(req, res) {
   const userId = getUserId(req);
 
   const { account, balance } =
     await fetchLiveDerivBalance(userId);
 
+  const data = serializeLiveBalance(
+    account,
+    balance
+  );
+
   return res.status(200).json({
     success: true,
-    data: serializeLiveBalance(
-      account,
-      balance
-    ),
+    data,
   });
 }
 
-/**
- * POST /account/deriv/balance/refresh
- *
- * Explicitly requests the latest balance directly from Deriv.
- *
- * This endpoint is functionally also live; it exists separately so
- * the frontend can expose a dedicated refresh action.
- */
+/* ============================================================
+   REFRESH CURRENT LIVE BALANCE
+
+   POST /api/v1/account/deriv/balance/refresh
+============================================================ */
+
 export async function refreshBalance(req, res) {
   const userId = getUserId(req);
 
   const { account, balance } =
     await fetchLiveDerivBalance(userId);
 
-  /**
-   * Activity logging is best-effort and must never affect the live
-   * balance response.
+  const data = serializeLiveBalance(
+    account,
+    balance
+  );
+
+  /*
+   * Best-effort activity logging.
+   * It must never block or modify the Deriv balance response.
    */
-  logActivitySafe({
-    userId,
-    type: "DERIV_BALANCE_REFRESHED",
-    title: "Deriv balance refreshed",
-    description:
-      "The selected Deriv account balance was refreshed directly from Deriv.",
-    metadata: {
-      accountId: String(account.derivAccountId),
-      source: "deriv_live",
-      currency:
-        balance?.currency ||
-        account.currency ||
-        null,
-    },
-  }).catch?.(() => {});
+  Promise.resolve(
+    logActivitySafe({
+      userId,
+      type: "DERIV_BALANCE_REFRESHED",
+      title: "Live Deriv balance refreshed",
+      description:
+        "The current balance was retrieved directly from the selected REAL Deriv account.",
+      metadata: {
+        derivAccountId: String(
+          account.derivAccountId
+        ),
+        accountType: "real",
+        currency: data.currency,
+        source: "deriv_live",
+      },
+    })
+  ).catch(() => {});
 
   return res.status(200).json({
     success: true,
     message:
-      "Live balance refreshed successfully",
-    data: serializeLiveBalance(
-      account,
-      balance
-    ),
+      "Live Deriv balance retrieved successfully",
+    data,
   });
 }

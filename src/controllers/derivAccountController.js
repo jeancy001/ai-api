@@ -1,22 +1,30 @@
 import { derivAuthService } from "../services/DerivAuthService.js";
 import { derivService } from "../services/DerivService.js";
-import { encrypt } from "../utils/crypto.js";
+
+import { encrypt, decrypt } from "../utils/crypto.js";
 import { DerivAccount } from "../models/DerivAccount.js";
 import { AppError } from "../utils/AppError.js";
 
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 
+/* ============================================================
+   HELPERS
+============================================================ */
+
 /**
- * Get the authenticated user ID.
+ * Get the authenticated user ID consistently.
  */
 function getUserId(req) {
-  const userId = req.user?.id || req.user?.sub;
+  const userId =
+    req.user?.id ||
+    req.user?.sub ||
+    req.user?._id;
 
   if (!userId) {
     throw new AppError(
       "Authentication required",
       401,
-      "UNAUTHORIZED",
+      "UNAUTHORIZED"
     );
   }
 
@@ -24,41 +32,30 @@ function getUserId(req) {
 }
 
 /**
- * Normalize Deriv account types for consistent comparisons.
+ * Normalize account type for comparisons.
  */
 function normalizeAccountType(type) {
-  return String(type || "")
+  const value = String(type || "")
     .trim()
     .toLowerCase();
-}
 
-/**
- * Get the application's in-memory OAuth state store.
- *
- * NOTE:
- * This works for a single Node.js process.
- * For multi-instance/serverless deployments, use a persistent
- * database-backed OAuth state store instead.
- */
-function getOAuthStates(req) {
-  if (!req.app.locals.oauthStates) {
-    req.app.locals.oauthStates = new Map();
+  if (
+    value === "real" ||
+    value === "live" ||
+    value === "real_money"
+  ) {
+    return "real";
   }
 
-  return req.app.locals.oauthStates;
-}
-
-/**
- * Remove expired OAuth states to prevent memory growth.
- */
-function cleanupExpiredStates(store) {
-  const now = Date.now();
-
-  for (const [state, value] of store.entries()) {
-    if (!value?.expires || value.expires <= now) {
-      store.delete(state);
-    }
+  if (
+    value === "demo" ||
+    value === "virtual" ||
+    value === "practice"
+  ) {
+    return "demo";
   }
+
+  return value || "unknown";
 }
 
 /**
@@ -71,7 +68,7 @@ function getFrontendUrl() {
     throw new AppError(
       "FRONTEND_URL is not configured",
       503,
-      "FRONTEND_NOT_CONFIGURED",
+      "FRONTEND_NOT_CONFIGURED"
     );
   }
 
@@ -91,13 +88,72 @@ function sanitizeAccount(account) {
 
   delete data.encryptedAccessToken;
   delete data.encryptedRefreshToken;
+  delete data.tokenExpiresAt;
 
   return data;
 }
 
 /**
- * START DERIV OAUTH CONNECTION
+ * Safely decrypt an account access token.
+ *
+ * Never return this token to the frontend.
  */
+function getAccessToken(account) {
+  try {
+    const token = decrypt(
+      account.encryptedAccessToken
+    );
+
+    if (
+      typeof token !== "string" ||
+      token.trim().length === 0
+    ) {
+      throw new Error("Empty token");
+    }
+
+    return token.trim();
+  } catch {
+    throw new AppError(
+      "Unable to access Deriv credentials. Please reconnect your Deriv account.",
+      401,
+      "DERIV_TOKEN_INVALID"
+    );
+  }
+}
+
+/* ============================================================
+   OAUTH STATE STORE
+
+   IMPORTANT:
+   This in-memory implementation is suitable only for a single
+   persistent Node.js process.
+
+   For Vercel/serverless or multiple instances, replace this with
+   MongoDB or Redis so the callback can access the PKCE verifier.
+============================================================ */
+
+function getOAuthStates(req) {
+  if (!req.app.locals.oauthStates) {
+    req.app.locals.oauthStates = new Map();
+  }
+
+  return req.app.locals.oauthStates;
+}
+
+function cleanupExpiredStates(store) {
+  const now = Date.now();
+
+  for (const [state, value] of store.entries()) {
+    if (!value?.expires || value.expires <= now) {
+      store.delete(state);
+    }
+  }
+}
+
+/* ============================================================
+   START DERIV OAUTH
+============================================================ */
+
 export async function connect(req, res) {
   const userId = getUserId(req);
 
@@ -112,7 +168,7 @@ export async function connect(req, res) {
     throw new AppError(
       "Unable to create Deriv authorization request",
       500,
-      "DERIV_AUTH_INITIALIZATION_FAILED",
+      "DERIV_AUTH_INITIALIZATION_FAILED"
     );
   }
 
@@ -120,10 +176,6 @@ export async function connect(req, res) {
 
   cleanupExpiredStates(oauthStates);
 
-  /**
-   * Store only temporarily.
-   * The verifier is required later for PKCE token exchange.
-   */
   oauthStates.set(authorization.state, {
     userId,
     verifier: authorization.verifier,
@@ -139,12 +191,10 @@ export async function connect(req, res) {
   });
 }
 
-/**
- * DERIV OAUTH CALLBACK
- *
- * The OAuth state is consumed exactly once.
- * Access tokens are encrypted and stored server-side only.
- */
+/* ============================================================
+   DERIV OAUTH CALLBACK
+============================================================ */
+
 export async function callback(req, res) {
   const code =
     typeof req.query.code === "string"
@@ -160,7 +210,7 @@ export async function callback(req, res) {
 
   if (!code || !state) {
     return res.redirect(
-      `${frontendUrl}/accounts?deriv=error&reason=invalid_response`,
+      `${frontendUrl}/accounts?deriv=error&reason=invalid_response`
     );
   }
 
@@ -171,20 +221,23 @@ export async function callback(req, res) {
   const savedState = oauthStates.get(state);
 
   /**
-   * OAuth state must be used only once.
-   * Delete it before exchanging the authorization code.
+   * Consume the state before token exchange.
+   * It cannot be reused.
    */
   oauthStates.delete(state);
 
   if (!savedState || savedState.expires <= Date.now()) {
     return res.redirect(
-      `${frontendUrl}/accounts?deriv=error&reason=state_expired`,
+      `${frontendUrl}/accounts?deriv=error&reason=state_expired`
     );
   }
 
-  if (!savedState.userId || !savedState.verifier) {
+  if (
+    !savedState.userId ||
+    !savedState.verifier
+  ) {
     return res.redirect(
-      `${frontendUrl}/accounts?deriv=error&reason=invalid_state`,
+      `${frontendUrl}/accounts?deriv=error&reason=invalid_state`
     );
   }
 
@@ -193,22 +246,25 @@ export async function callback(req, res) {
   try {
     token = await derivAuthService.exchange(
       code,
-      savedState.verifier,
+      savedState.verifier
     );
   } catch (error) {
     req.app.locals.logger?.error?.(
       { err: error },
-      "Deriv OAuth token exchange failed",
+      "Deriv OAuth token exchange failed"
     );
 
     return res.redirect(
-      `${frontendUrl}/accounts?deriv=error&reason=authorization_failed`,
+      `${frontendUrl}/accounts?deriv=error&reason=authorization_failed`
     );
   }
 
-  if (!token?.access_token) {
+  if (
+    !token?.access_token ||
+    typeof token.access_token !== "string"
+  ) {
     return res.redirect(
-      `${frontendUrl}/accounts?deriv=error&reason=token_missing`,
+      `${frontendUrl}/accounts?deriv=error&reason=token_missing`
     );
   }
 
@@ -217,55 +273,68 @@ export async function callback(req, res) {
   let derivAccounts;
 
   try {
-    derivAccounts =
-      await derivService.listAccounts(
-        token.access_token,
-      );
+    /**
+     * Accounts are obtained directly from Deriv.
+     * MongoDB is not treated as the source of account truth.
+     */
+    derivAccounts = await derivService.listAccounts(
+      token.access_token
+    );
   } catch (error) {
     req.app.locals.logger?.error?.(
       { err: error, userId },
-      "Failed to retrieve Deriv accounts",
+      "Failed to retrieve live Deriv accounts"
     );
 
     return res.redirect(
-      `${frontendUrl}/accounts?deriv=error&reason=accounts_failed`,
+      `${frontendUrl}/accounts?deriv=error&reason=accounts_failed`
     );
   }
 
-  if (!Array.isArray(derivAccounts)) {
+  if (
+    !Array.isArray(derivAccounts) ||
+    derivAccounts.length === 0
+  ) {
     return res.redirect(
-      `${frontendUrl}/accounts?deriv=error&reason=invalid_accounts`,
+      `${frontendUrl}/accounts?deriv=error&reason=no_accounts`
     );
   }
 
   const encryptedAccessToken = encrypt(
-    token.access_token,
+    token.access_token
   );
 
   const encryptedRefreshToken =
-    token.refresh_token
+    typeof token.refresh_token === "string" &&
+    token.refresh_token.trim()
       ? encrypt(token.refresh_token)
       : null;
 
-  const tokenExpiresAt = token.expires_in
-    ? new Date(
-        Date.now() +
-          Number(token.expires_in) * 1000,
-      )
-    : null;
+  const expiresIn = Number(token.expires_in);
+
+  const tokenExpiresAt =
+    Number.isFinite(expiresIn) && expiresIn > 0
+      ? new Date(Date.now() + expiresIn * 1000)
+      : null;
 
   const now = new Date();
 
   const operations = derivAccounts
-    .map((account) => {
+    .map((derivAccount) => {
       const derivAccountId =
-        account.account_id ||
-        account.loginid ||
-        account.login_id;
+        derivAccount.account_id ||
+        derivAccount.loginid ||
+        derivAccount.login_id;
 
       if (!derivAccountId) {
         return null;
       }
+
+      const accountType = normalizeAccountType(
+        derivAccount.account_type ||
+          derivAccount.accountType ||
+          derivAccount.type
+      );
 
       return {
         updateOne: {
@@ -273,25 +342,46 @@ export async function callback(req, res) {
             userId,
             derivAccountId: String(derivAccountId),
           },
+
           update: {
             $set: {
-              connected: true,
+              userId,
               derivAccountId: String(derivAccountId),
-              accountType: normalizeAccountType(
-                account.account_type ||
-                  account.accountType,
-              ),
-              currency: account.currency || null,
-              status: account.status || "active",
-              group: account.group || null,
+
+              /**
+               * Connection metadata only.
+               * Balances are NEVER stored or used here.
+               */
+              connected: true,
+              connectionStatus: "connected",
+
+              accountType,
+              currency:
+                derivAccount.currency || null,
+
+              status:
+                derivAccount.status || "active",
+
+              group:
+                derivAccount.group || null,
+
               encryptedAccessToken,
               encryptedRefreshToken,
               tokenExpiresAt,
-              connectionStatus: "connected",
+
               lastVerifiedAt: now,
+
+              /**
+               * Preserve the original connection time when possible.
+               */
               connectedAt: now,
             },
+
+            $setOnInsert: {
+              selected: false,
+            },
           },
+
           upsert: true,
         },
       };
@@ -300,32 +390,39 @@ export async function callback(req, res) {
 
   if (operations.length === 0) {
     return res.redirect(
-      `${frontendUrl}/accounts?deriv=error&reason=no_accounts`,
+      `${frontendUrl}/accounts?deriv=error&reason=no_valid_accounts`
     );
   }
 
   try {
-    await DerivAccount.bulkWrite(operations);
+    await DerivAccount.bulkWrite(operations, {
+      ordered: false,
+    });
   } catch (error) {
     req.app.locals.logger?.error?.(
       { err: error, userId },
-      "Failed to save Deriv accounts",
+      "Failed to save Deriv connection metadata"
     );
 
     return res.redirect(
-      `${frontendUrl}/accounts?deriv=error&reason=save_failed`,
+      `${frontendUrl}/accounts?deriv=error&reason=save_failed`
     );
   }
 
   return res.redirect(
-    `${frontendUrl}/accounts?deriv=connected`,
+    `${frontendUrl}/accounts?deriv=connected`
   );
 }
 
+/* ============================================================
+   GET CONNECTED DERIV ACCOUNTS
+============================================================ */
+
 /**
- * GET CONNECTED DERIV ACCOUNTS
+ * Returns connection metadata.
  *
- * Sensitive encrypted credentials are never returned.
+ * For production, you can optionally verify accounts against Deriv
+ * here. Credentials and balances are never returned.
  */
 export async function accounts(req, res) {
   const userId = getUserId(req);
@@ -335,7 +432,7 @@ export async function accounts(req, res) {
     connected: true,
   })
     .select(
-      "-encryptedAccessToken -encryptedRefreshToken",
+      "-encryptedAccessToken -encryptedRefreshToken -tokenExpiresAt"
     )
     .sort({
       selected: -1,
@@ -350,11 +447,10 @@ export async function accounts(req, res) {
   });
 }
 
-/**
- * SELECT A REAL DERIV ACCOUNT
- *
- * Only REAL accounts can be selected for live auto-trading.
- */
+/* ============================================================
+   SELECT REAL DERIV ACCOUNT
+============================================================ */
+
 export async function select(req, res) {
   const userId = getUserId(req);
 
@@ -362,25 +458,28 @@ export async function select(req, res) {
     req.body?.derivAccountId ||
     req.body?.accountId;
 
-  if (!derivAccountId) {
+  if (
+    typeof derivAccountId !== "string" ||
+    !derivAccountId.trim()
+  ) {
     throw new AppError(
       "Deriv account ID is required",
       400,
-      "ACCOUNT_ID_REQUIRED",
+      "ACCOUNT_ID_REQUIRED"
     );
   }
 
   const account = await DerivAccount.findOne({
     userId,
-    derivAccountId: String(derivAccountId),
+    derivAccountId: derivAccountId.trim(),
     connected: true,
-  });
+  }).select("+encryptedAccessToken");
 
   if (!account) {
     throw new AppError(
-      "Account not found",
+      "Connected Deriv account not found",
       404,
-      "ACCOUNT_NOT_FOUND",
+      "ACCOUNT_NOT_FOUND"
     );
   }
 
@@ -389,14 +488,70 @@ export async function select(req, res) {
     "real"
   ) {
     throw new AppError(
-      "Only a real account can be selected for live trading",
+      "Only a real Deriv account can be selected for real-money auto-trading",
       400,
-      "NOT_REAL_ACCOUNT",
+      "NOT_REAL_ACCOUNT"
     );
   }
 
   /**
-   * Clear every previous account selection for this user.
+   * Verify the account against Deriv before selecting it.
+   *
+   * This prevents selecting an account solely based on stale MongoDB
+   * metadata.
+   */
+  const accessToken = getAccessToken(account);
+
+  let liveAccounts;
+
+  try {
+    liveAccounts = await derivService.listAccounts(
+      accessToken
+    );
+  } catch {
+    throw new AppError(
+      "Unable to verify the selected account with Deriv. Please reconnect your account.",
+      502,
+      "DERIV_ACCOUNT_VERIFICATION_FAILED"
+    );
+  }
+
+  const liveAccount = Array.isArray(liveAccounts)
+    ? liveAccounts.find((item) => {
+        const id =
+          item.account_id ||
+          item.loginid ||
+          item.login_id;
+
+        return String(id || "") ===
+          String(account.derivAccountId);
+      })
+    : null;
+
+  if (!liveAccount) {
+    throw new AppError(
+      "The selected account is no longer available on Deriv",
+      404,
+      "DERIV_ACCOUNT_NOT_AVAILABLE"
+    );
+  }
+
+  const liveType = normalizeAccountType(
+    liveAccount.account_type ||
+      liveAccount.accountType ||
+      liveAccount.type
+  );
+
+  if (liveType !== "real") {
+    throw new AppError(
+      "Deriv did not verify this account as a real account",
+      403,
+      "DERIV_REAL_ACCOUNT_REQUIRED"
+    );
+  }
+
+  /**
+   * Only one selected account per user.
    */
   await DerivAccount.updateMany(
     {
@@ -408,10 +563,21 @@ export async function select(req, res) {
       $set: {
         selected: false,
       },
-    },
+    }
   );
 
+  /**
+   * Update only connection metadata from the live Deriv response.
+   * Do NOT store or copy any balance.
+   */
   account.selected = true;
+  account.connected = true;
+  account.connectionStatus = "connected";
+  account.accountType = "real";
+  account.currency =
+    liveAccount.currency ||
+    account.currency ||
+    null;
   account.lastVerifiedAt = new Date();
 
   await account.save();
@@ -419,7 +585,32 @@ export async function select(req, res) {
   return res.status(200).json({
     success: true,
     message:
-      "Deriv real account selected successfully",
+      "Deriv real account selected and verified successfully",
     data: sanitizeAccount(account),
+  });
+}
+
+/* ============================================================
+   GET SELECTED CONNECTION STATUS
+============================================================ */
+
+export async function connection(req, res) {
+  const userId = getUserId(req);
+
+  const account = await DerivAccount.findOne({
+    userId,
+    selected: true,
+    connected: true,
+  })
+    .select(
+      "-encryptedAccessToken -encryptedRefreshToken -tokenExpiresAt"
+    )
+    .lean();
+
+  return res.status(200).json({
+    success: true,
+    data: account
+      ? sanitizeAccount(account)
+      : null,
   });
 }
