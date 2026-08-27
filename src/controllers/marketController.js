@@ -1,13 +1,21 @@
 import { derivMarketService } from "../services/DerivMarketService.js";
 import { AppError } from "../utils/AppError.js";
 
+/* ============================================================
+   VALIDATION & NORMALIZATION
+============================================================ */
+
 /**
  * Validate and normalize a market symbol received from the URL.
+ *
+ * Do not force uppercase here. Some Deriv symbols can contain
+ * lowercase characters (for example, frxEURUSD), and changing
+ * the symbol can cause provider lookup failures.
  */
 function getSymbol(req) {
   const symbol =
     typeof req.params?.symbol === "string"
-      ? req.params.symbol.trim().toUpperCase()
+      ? req.params.symbol.trim()
       : "";
 
   if (!symbol) {
@@ -38,77 +46,306 @@ function getLimit(value, fallback = 100, max = 1000) {
 }
 
 /**
+ * Parse an optional positive integer.
+ */
+function getOptionalNumber(value, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return undefined;
+  }
+
+  return Math.min(
+    Math.max(Math.floor(parsed), min),
+    max,
+  );
+}
+
+/**
+ * Normalize a value that may be a number or numeric string.
+ * We deliberately preserve numeric strings because the frontend
+ * supports both numbers and strings from the provider.
+ */
+function getNumericValue(value) {
+  if (
+    typeof value === "number" ||
+    typeof value === "string"
+  ) {
+    return value;
+  }
+
+  return undefined;
+}
+
+/* ============================================================
+   MARKET SERIALIZATION
+============================================================ */
+
+/**
  * Normalize market data for the frontend.
- *
- * Keeps the original Deriv data while exposing commonly used fields
- * consistently.
  */
 function serializeMarket(market) {
   if (!market) return null;
 
   return {
+    id: market.id || market.symbol || null,
+
     symbol: market.symbol || null,
 
-    displayName:
+    display_name:
       market.display_name ||
       market.displayName ||
       market.symbol ||
       null,
 
-    market:
-      market.market ||
-      market.market_display_name ||
+    displayName:
+      market.displayName ||
+      market.display_name ||
+      market.symbol ||
       null,
 
-    marketDisplayName:
-      market.market_display_name ||
-      market.market ||
-      null,
+    market: market.market || null,
 
-    subgroup:
+    submarket:
+      market.submarket ||
       market.subgroup ||
+      market.submarket_display_name ||
       market.subgroup_display_name ||
       null,
 
-    subgroupDisplayName:
+    market_display_name:
+      market.market_display_name ||
+      market.market ||
+      null,
+
+    submarket_display_name:
+      market.submarket_display_name ||
       market.subgroup_display_name ||
+      market.submarket ||
       market.subgroup ||
       null,
 
-    exchangeIsOpen:
+    symbol_type: market.symbol_type || null,
+
+    exchange_is_open:
       market.exchange_is_open === 1 ||
       market.exchange_is_open === true,
 
-    pip:
-      market.pip ??
-      null,
+    isTradingAvailable:
+      market.exchange_is_open === 1 ||
+      market.exchange_is_open === true,
 
-    /**
-     * Price is populated when the market service provides a quote.
-     * active_symbols itself does not necessarily contain live prices.
-     */
+    currency: market.currency || null,
+
     price:
-      market.price ??
-      market.quote ??
-      null,
+      getNumericValue(
+        market.price ??
+        market.quote ??
+        market.latestPrice ??
+        market.lastPrice,
+      ) ?? null,
 
-    /**
-     * Keep the complete Deriv metadata available for future frontend use.
-     */
-    raw: market,
+    latestPrice:
+      getNumericValue(
+        market.latestPrice ??
+        market.price ??
+        market.quote,
+      ) ?? null,
+
+    lastPrice:
+      getNumericValue(
+        market.lastPrice ??
+        market.price ??
+        market.quote,
+      ) ?? null,
+
+    quote:
+      getNumericValue(
+        market.quote ??
+        market.price,
+      ) ?? null,
+
+    bid: getNumericValue(market.bid) ?? null,
+    ask: getNumericValue(market.ask) ?? null,
+
+    change: getNumericValue(market.change) ?? null,
+
+    changePercent:
+      getNumericValue(
+        market.changePercent ??
+        market.change_percent,
+      ) ?? null,
+
+    previousClose:
+      getNumericValue(
+        market.previousClose ??
+        market.previous_close,
+      ) ?? null,
+
+    open: getNumericValue(market.open) ?? null,
+
+    updatedAt:
+      market.updatedAt ||
+      market.updated_at ||
+      null,
   };
 }
 
 /**
- * GET /markets
+ * Normalize a real Deriv quote for the frontend.
+ */
+function serializePrice(price, fallbackSymbol = null) {
+  if (!price) return null;
+
+  /**
+   * Some service implementations may return the quote directly.
+   */
+  if (
+    typeof price === "number" ||
+    typeof price === "string"
+  ) {
+    return {
+      symbol: fallbackSymbol,
+      price,
+      quote: price,
+      latestPrice: price,
+    };
+  }
+
+  return {
+    symbol:
+      price.symbol ||
+      price.underlying_symbol ||
+      fallbackSymbol ||
+      null,
+
+    price:
+      getNumericValue(
+        price.price ??
+        price.quote ??
+        price.lastPrice ??
+        price.last_price,
+      ) ?? null,
+
+    latestPrice:
+      getNumericValue(
+        price.latestPrice ??
+        price.price ??
+        price.quote ??
+        price.last_price,
+      ) ?? null,
+
+    lastPrice:
+      getNumericValue(
+        price.lastPrice ??
+        price.last_price ??
+        price.price ??
+        price.quote,
+      ) ?? null,
+
+    quote:
+      getNumericValue(
+        price.quote ??
+        price.price ??
+        price.last_price,
+      ) ?? null,
+
+    bid: getNumericValue(price.bid) ?? null,
+    ask: getNumericValue(price.ask) ?? null,
+
+    change: getNumericValue(price.change) ?? null,
+
+    changePercent:
+      getNumericValue(
+        price.changePercent ??
+        price.change_percent,
+      ) ?? null,
+
+    previousClose:
+      getNumericValue(
+        price.previousClose ??
+        price.previous_close,
+      ) ?? null,
+
+    currency: price.currency || null,
+
+    epoch:
+      price.epoch ??
+      price.timestamp ??
+      null,
+
+    updatedAt:
+      price.updatedAt ||
+      price.updated_at ||
+      new Date().toISOString(),
+  };
+}
+
+/**
+ * Normalize one OHLC candle.
+ */
+function serializeCandle(candle) {
+  if (!candle) return null;
+
+  return {
+    epoch:
+      candle.epoch ??
+      candle.open_time ??
+      candle.time ??
+      candle.timestamp ??
+      null,
+
+    time:
+      candle.time ??
+      candle.open_time ??
+      candle.epoch ??
+      null,
+
+    timestamp:
+      candle.timestamp ??
+      candle.time ??
+      candle.epoch ??
+      null,
+
+    open:
+      getNumericValue(candle.open) ?? 0,
+
+    high:
+      getNumericValue(candle.high) ?? 0,
+
+    low:
+      getNumericValue(candle.low) ?? 0,
+
+    close:
+      getNumericValue(candle.close) ?? 0,
+
+    volume:
+      getNumericValue(
+        candle.volume ??
+        candle.tick_count,
+      ) ?? undefined,
+  };
+}
+
+/* ============================================================
+   MARKET LIST
+============================================================ */
+
+/**
+ * GET /api/v1/markets
  *
  * Query parameters:
- *
  * ?limit=100
  * ?market=Forex
  * ?search=Volatility
- *
- * Returns currently available Deriv markets.
  */
 export async function list(req, res) {
   const limit = getLimit(req.query.limit, 500);
@@ -130,9 +367,6 @@ export async function list(req, res) {
     ? markets
     : [];
 
-  /**
-   * Optional category/market filtering.
-   */
   if (marketFilter) {
     filtered = filtered.filter((item) => {
       const marketName = String(
@@ -145,9 +379,6 @@ export async function list(req, res) {
     });
   }
 
-  /**
-   * Search by symbol or display name.
-   */
   if (search) {
     filtered = filtered.filter((item) => {
       const haystack = [
@@ -155,6 +386,8 @@ export async function list(req, res) {
         item.display_name,
         item.market,
         item.market_display_name,
+        item.submarket,
+        item.submarket_display_name,
         item.subgroup,
         item.subgroup_display_name,
       ]
@@ -170,13 +403,12 @@ export async function list(req, res) {
 
   const data = filtered
     .slice(0, limit)
-    .map(serializeMarket);
+    .map(serializeMarket)
+    .filter(Boolean);
 
   return res.status(200).json({
     success: true,
-
     data,
-
     meta: {
       total,
       returned: data.length,
@@ -187,10 +419,73 @@ export async function list(req, res) {
   });
 }
 
+/* ============================================================
+   ALL LIVE PRICES
+============================================================ */
+
 /**
- * GET /markets/:symbol
+ * GET /api/v1/markets/prices
  *
- * Returns detailed information about one Deriv market.
+ * Returns real latest prices from Deriv.
+ *
+ * This controller intentionally does not manufacture prices.
+ * DerivMarketService is responsible for obtaining and caching
+ * real provider data.
+ *
+ * Optional query parameter:
+ * ?limit=100
+ */
+export async function prices(req, res) {
+  if (
+    typeof derivMarketService.prices !== "function"
+  ) {
+    throw new AppError(
+      "Live market prices are not configured on the backend",
+      503,
+      "MARKET_PRICES_UNAVAILABLE",
+    );
+  }
+
+  const limit = getLimit(req.query.limit, 100, 1000);
+
+  const result =
+    await derivMarketService.prices({ limit });
+
+  /**
+   * Support service responses such as:
+   * - MarketPrice[]
+   * - { prices: MarketPrice[] }
+   * - { data: MarketPrice[] }
+   */
+  const rawPrices = Array.isArray(result)
+    ? result
+    : Array.isArray(result?.prices)
+      ? result.prices
+      : Array.isArray(result?.data)
+        ? result.data
+        : [];
+
+  const data = rawPrices
+    .map((item) => serializePrice(item))
+    .filter((item) => item?.symbol);
+
+  return res.status(200).json({
+    success: true,
+    data,
+    meta: {
+      total: data.length,
+      source: "Deriv",
+      updatedAt: new Date().toISOString(),
+    },
+  });
+}
+
+/* ============================================================
+   SINGLE MARKET
+============================================================ */
+
+/**
+ * GET /api/v1/markets/:symbol
  */
 export async function one(req, res) {
   const symbol = getSymbol(req);
@@ -206,10 +501,6 @@ export async function one(req, res) {
     );
   }
 
-  /**
-   * If the service supports retrieving a current quote,
-   * include it without making it mandatory.
-   */
   let price = null;
 
   try {
@@ -220,22 +511,39 @@ export async function one(req, res) {
         await derivMarketService.price(symbol);
     }
   } catch (error) {
-    /**
-     * Market details should still work if a live price is
-     * temporarily unavailable.
-     */
     console.warn(
       `Unable to retrieve price for ${symbol}:`,
       error?.message || error,
     );
   }
 
+  const normalizedPrice =
+    serializePrice(price, symbol);
+
   const data = serializeMarket({
     ...market,
+
     price:
-      price?.quote ??
-      price?.price ??
-      price ??
+      normalizedPrice?.price ??
+      market.price ??
+      null,
+
+    quote:
+      normalizedPrice?.quote ??
+      market.quote ??
+      null,
+
+    latestPrice:
+      normalizedPrice?.latestPrice ??
+      null,
+
+    lastPrice:
+      normalizedPrice?.lastPrice ??
+      null,
+
+    updatedAt:
+      normalizedPrice?.updatedAt ??
+      market.updatedAt ??
       null,
   });
 
@@ -245,22 +553,189 @@ export async function one(req, res) {
   });
 }
 
+/* ============================================================
+   SINGLE LIVE PRICE
+============================================================ */
+
 /**
- * GET /markets/:symbol/contracts
+ * GET /api/v1/markets/:symbol/price
  *
- * Returns available contract types for a specific market.
+ * Returns a real current quote for one market.
+ */
+export async function price(req, res) {
+  const symbol = getSymbol(req);
+
+  if (
+    typeof derivMarketService.price !== "function"
+  ) {
+    throw new AppError(
+      "Live market prices are not configured on the backend",
+      503,
+      "MARKET_PRICE_UNAVAILABLE",
+    );
+  }
+
+  /**
+   * Verify the symbol against the real market catalogue first.
+   */
+  const market =
+    await derivMarketService.symbol(symbol);
+
+  if (!market) {
+    throw new AppError(
+      `Market "${symbol}" was not found`,
+      404,
+      "MARKET_NOT_FOUND",
+    );
+  }
+
+  const result =
+    await derivMarketService.price(symbol);
+
+  const data =
+    serializePrice(result, symbol);
+
+  if (
+    !data ||
+    (
+      data.price === null &&
+      data.quote === null
+    )
+  ) {
+    throw new AppError(
+      `A live price is currently unavailable for "${symbol}"`,
+      503,
+      "PRICE_UNAVAILABLE",
+    );
+  }
+
+  return res.status(200).json({
+    success: true,
+    data,
+  });
+}
+
+/* ============================================================
+   REAL OHLC CANDLES
+============================================================ */
+
+/**
+ * GET /api/v1/markets/:symbol/candles
  *
- * IMPORTANT:
- * Contract availability is not the same thing as active symbols.
- * The DerivMarketService should query contract availability from
- * Deriv instead of filtering active_symbols.
+ * Query parameters:
+ * - granularity
+ * - count
+ * - start
+ * - end
+ */
+export async function candles(req, res) {
+  const symbol = getSymbol(req);
+
+  if (
+    typeof derivMarketService.candles !== "function"
+  ) {
+    throw new AppError(
+      "Historical market candles are not configured on the backend",
+      503,
+      "MARKET_CANDLES_UNAVAILABLE",
+    );
+  }
+
+  const market =
+    await derivMarketService.symbol(symbol);
+
+  if (!market) {
+    throw new AppError(
+      `Market "${symbol}" was not found`,
+      404,
+      "MARKET_NOT_FOUND",
+    );
+  }
+
+  const granularity = getLimit(
+    req.query.granularity,
+    60,
+    86_400,
+  );
+
+  const count = getLimit(
+    req.query.count,
+    100,
+    5_000,
+  );
+
+  const start = getOptionalNumber(
+    req.query.start,
+    0,
+  );
+
+  const end = getOptionalNumber(
+    req.query.end,
+    0,
+  );
+
+  if (
+    start !== undefined &&
+    end !== undefined &&
+    start >= end
+  ) {
+    throw new AppError(
+      "The candle start time must be earlier than the end time",
+      400,
+      "VALIDATION_ERROR",
+    );
+  }
+
+  const result =
+    await derivMarketService.candles(symbol, {
+      granularity,
+      count,
+      start,
+      end,
+    });
+
+  /**
+   * Support different service response shapes.
+   */
+  const rawCandles = Array.isArray(result)
+    ? result
+    : Array.isArray(result?.candles)
+      ? result.candles
+      : Array.isArray(result?.data)
+        ? result.data
+        : [];
+
+  const data = rawCandles
+    .map(serializeCandle)
+    .filter(Boolean)
+    .filter((candle) =>
+      candle.open !== null &&
+      candle.high !== null &&
+      candle.low !== null &&
+      candle.close !== null
+    );
+
+  return res.status(200).json({
+    success: true,
+    data: {
+      symbol,
+      granularity,
+      count: data.length,
+      candles: data,
+    },
+  });
+}
+
+/* ============================================================
+   CONTRACTS
+============================================================ */
+
+/**
+ * GET /api/v1/markets/:symbol/contracts
  */
 export async function contracts(req, res) {
   const symbol = getSymbol(req);
 
-  /**
-   * Verify the symbol exists first.
-   */
   const market =
     await derivMarketService.symbol(symbol);
 
@@ -291,10 +766,14 @@ export async function contracts(req, res) {
   });
 }
 
+/* ============================================================
+   REFRESH MARKETS
+============================================================ */
+
 /**
- * POST /markets/refresh
+ * POST /api/v1/markets/refresh
  *
- * Refreshes cached Deriv market data.
+ * Refreshes cached real Deriv market data.
  */
 export async function refresh(req, res) {
   let markets;
@@ -311,15 +790,13 @@ export async function refresh(req, res) {
   }
 
   const data = Array.isArray(markets)
-    ? markets.map(serializeMarket)
+    ? markets.map(serializeMarket).filter(Boolean)
     : [];
 
   return res.status(200).json({
     success: true,
     message: "Markets refreshed successfully",
-
     data,
-
     meta: {
       total: data.length,
       refreshedAt: new Date().toISOString(),
