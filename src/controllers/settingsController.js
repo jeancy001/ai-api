@@ -1,6 +1,16 @@
 import { TradingSettings } from "../models/TradingSettings.js";
 import { AppError } from "../utils/AppError.js";
+import { derivMarketService } from "../services/DerivMarketService.js";
+import { logActivitySafe } from "../services/ActivityService.js";
 
+/**
+ * Fields the client is allowed to modify.
+ *
+ * IMPORTANT:
+ * Trading engine state and real-money authorization are intentionally
+ * NOT included here. Those fields must only be controlled by dedicated
+ * backend endpoints.
+ */
 const ALLOWED_FIELDS = new Set([
   "selectedMarket",
   "stake",
@@ -14,6 +24,19 @@ const ALLOWED_FIELDS = new Set([
   "cooldown",
 ]);
 
+const MIN_ANALYSIS_INTERVAL = 5_000;
+const MAX_ANALYSIS_INTERVAL = 60 * 60 * 1000; // 1 hour
+
+const MIN_COOLDOWN = 0;
+const MAX_COOLDOWN = 60 * 60 * 1000; // 1 hour
+
+/* ============================================================
+   HELPERS
+============================================================ */
+
+/**
+ * Get the authenticated user ID consistently.
+ */
 function getUserId(req) {
   const userId =
     req.user?.id ||
@@ -31,12 +54,18 @@ function getUserId(req) {
   return String(userId);
 }
 
+/**
+ * Default settings for a new user.
+ *
+ * Trading is disabled and unauthorized by default.
+ */
 function createDefaultSettings(userId) {
   return {
     userId,
+
     selectedMarket: null,
 
-    // Trading is always disabled by default.
+    // Safety defaults.
     autoTradingEnabled: false,
     realTradingAuthorized: false,
     emergencyStop: false,
@@ -44,21 +73,35 @@ function createDefaultSettings(userId) {
     stake: 1,
     maxStake: 10,
     minimumBalance: 0,
+
     maxDailyLoss: 10,
     maxDailyTrades: 10,
     maxConsecutiveLosses: 3,
 
-    // AI confidence from 0 to 1.
+    // AI confidence is between 0 and 1.
     aiConfidenceThreshold: 0.7,
 
     // Milliseconds.
-    analysisInterval: 15000,
-    cooldown: 5000,
+    analysisInterval: 15_000,
+    cooldown: 5_000,
   };
 }
 
 /**
- * Validate values that are important for risk management.
+ * Return a plain object suitable for the API.
+ */
+function serializeSettings(settings) {
+  if (!settings) {
+    return null;
+  }
+
+  return typeof settings.toObject === "function"
+    ? settings.toObject()
+    : { ...settings };
+}
+
+/**
+ * Validate and normalize incoming settings.
  */
 function validatePatch(patch) {
   const numericFields = [
@@ -74,7 +117,9 @@ function validatePatch(patch) {
   ];
 
   for (const field of numericFields) {
-    if (!(field in patch)) continue;
+    if (!(field in patch)) {
+      continue;
+    }
 
     const value = Number(patch[field]);
 
@@ -173,10 +218,12 @@ function validatePatch(patch) {
 
   if (
     patch.analysisInterval !== undefined &&
-    patch.analysisInterval < 5000
+    (!Number.isInteger(patch.analysisInterval) ||
+      patch.analysisInterval < MIN_ANALYSIS_INTERVAL ||
+      patch.analysisInterval > MAX_ANALYSIS_INTERVAL)
   ) {
     throw new AppError(
-      "Analysis interval must be at least 5000 milliseconds",
+      `Analysis interval must be an integer between ${MIN_ANALYSIS_INTERVAL} and ${MAX_ANALYSIS_INTERVAL} milliseconds`,
       400,
       "VALIDATION_ERROR",
     );
@@ -184,10 +231,12 @@ function validatePatch(patch) {
 
   if (
     patch.cooldown !== undefined &&
-    patch.cooldown < 0
+    (!Number.isInteger(patch.cooldown) ||
+      patch.cooldown < MIN_COOLDOWN ||
+      patch.cooldown > MAX_COOLDOWN)
   ) {
     throw new AppError(
-      "Cooldown cannot be negative",
+      `Cooldown must be an integer between ${MIN_COOLDOWN} and ${MAX_COOLDOWN} milliseconds`,
       400,
       "VALIDATION_ERROR",
     );
@@ -199,7 +248,7 @@ function validatePatch(patch) {
     typeof patch.selectedMarket !== "string"
   ) {
     throw new AppError(
-      "Selected market must be a valid symbol",
+      "Selected market must be a valid market symbol",
       400,
       "VALIDATION_ERROR",
     );
@@ -216,36 +265,80 @@ function validatePatch(patch) {
 }
 
 /**
- * GET /settings/trading
+ * Verify that a selected market exists and is currently open on Deriv.
  */
-export async function get(req, res) {
-  const userId = getUserId(req);
+async function validateSelectedMarket(selectedMarket) {
+  if (!selectedMarket) {
+    return;
+  }
 
-  let settings = await TradingSettings.findOne({
-    userId,
-  });
+  const market =
+    await derivMarketService.symbol(selectedMarket);
 
-  /**
-   * Safety: ensure every authenticated user has settings.
-   */
+  if (!market) {
+    throw new AppError(
+      `The market "${selectedMarket}" is not currently available on Deriv`,
+      400,
+      "MARKET_UNAVAILABLE",
+    );
+  }
+
+  if (
+    market.exchange_is_open === 0 ||
+    market.exchange_is_open === false
+  ) {
+    throw new AppError(
+      `The market "${selectedMarket}" is currently closed`,
+      400,
+      "MARKET_CLOSED",
+    );
+  }
+}
+
+/**
+ * Ensure the user's settings document exists.
+ */
+async function getOrCreateSettings(userId) {
+  let settings =
+    await TradingSettings.findOne({ userId });
+
   if (!settings) {
     settings = await TradingSettings.create(
       createDefaultSettings(userId),
     );
   }
 
-  return res.json({
+  return settings;
+}
+
+/* ============================================================
+   GET /api/v1/settings/trading
+============================================================ */
+
+export async function get(req, res) {
+  const userId = getUserId(req);
+
+  const settings =
+    await getOrCreateSettings(userId);
+
+  return res.status(200).json({
     success: true,
-    data: settings,
+    data: serializeSettings(settings),
   });
 }
 
+/* ============================================================
+   PUT /api/v1/settings/trading
+============================================================ */
+
 /**
- * PUT /settings/trading
+ * Only explicitly whitelisted configuration fields may be modified.
  *
- * Only explicitly allowed risk/settings fields can be changed.
- * Security-sensitive fields such as autoTradingEnabled and
- * realTradingAuthorized are controlled by dedicated endpoints.
+ * Security-sensitive fields remain backend-controlled:
+ * - autoTradingEnabled
+ * - realTradingAuthorized
+ * - emergencyStop
+ * - stopReason
  */
 export async function update(req, res) {
   const userId = getUserId(req);
@@ -262,15 +355,29 @@ export async function update(req, res) {
     );
   }
 
-  const patch = Object.fromEntries(
-    Object.entries(req.body).filter(([key]) =>
-      ALLOWED_FIELDS.has(key),
-    ),
-  );
+  const submittedFields = Object.keys(req.body);
+
+  const forbiddenFields =
+    submittedFields.filter(
+      (field) => !ALLOWED_FIELDS.has(field),
+    );
+
+  /**
+   * Reject unknown fields rather than silently ignoring them.
+   */
+  if (forbiddenFields.length > 0) {
+    throw new AppError(
+      `The following settings cannot be modified: ${forbiddenFields.join(", ")}`,
+      403,
+      "SETTINGS_FIELD_NOT_ALLOWED",
+    );
+  }
+
+  const patch = { ...req.body };
 
   if (Object.keys(patch).length === 0) {
     throw new AppError(
-      "No valid settings were provided",
+      "No settings were provided",
       400,
       "VALIDATION_ERROR",
     );
@@ -278,22 +385,17 @@ export async function update(req, res) {
 
   validatePatch(patch);
 
-  /**
-   * Protect against inconsistent stake limits.
-   */
-  const current = await TradingSettings.findOne({
-    userId,
-  });
+  const current =
+    await getOrCreateSettings(userId);
 
+  /**
+   * Never allow inconsistent stake limits.
+   */
   const effectiveStake =
-    patch.stake ??
-    current?.stake ??
-    1;
+    patch.stake ?? current.stake;
 
   const effectiveMaxStake =
-    patch.maxStake ??
-    current?.maxStake ??
-    10;
+    patch.maxStake ?? current.maxStake;
 
   if (effectiveStake > effectiveMaxStake) {
     throw new AppError(
@@ -303,24 +405,63 @@ export async function update(req, res) {
     );
   }
 
-  const settings =
-    await TradingSettings.findOneAndUpdate(
-      { userId },
-      {
-        $set: patch,
-        $setOnInsert: createDefaultSettings(userId),
-      },
-      {
-        new: true,
-        upsert: true,
-        runValidators: true,
-        setDefaultsOnInsert: true,
-      },
+  /**
+   * Validate the market only when the user is changing it.
+   */
+  if (
+    Object.prototype.hasOwnProperty.call(
+      patch,
+      "selectedMarket",
+    )
+  ) {
+    await validateSelectedMarket(
+      patch.selectedMarket,
     );
+  }
 
-  return res.json({
+  /**
+   * Safety policy:
+   * Trading/risk configuration cannot be changed while
+   * automatic trading is active.
+   */
+  if (current.autoTradingEnabled) {
+    throw new AppError(
+      "Stop auto-trading before changing trading or risk settings",
+      409,
+      "STOP_TRADING_BEFORE_SETTINGS_CHANGE",
+    );
+  }
+
+  /**
+   * Apply changes to the existing document.
+   */
+  Object.assign(current, patch);
+
+  await current.save();
+
+  /**
+   * Logging must never make a successful settings update fail.
+   *
+   * logActivitySafe already handles errors internally.
+   */
+  await logActivitySafe({
+    userId,
+    type: "TRADING_SETTINGS_UPDATED",
+    title: "Trading settings updated",
+    description:
+      "The user updated automatic trading configuration.",
+    metadata: {
+      changedFields: Object.keys(patch),
+      selectedMarket:
+        patch.selectedMarket ??
+        current.selectedMarket ??
+        null,
+    },
+  });
+
+  return res.status(200).json({
     success: true,
     message: "Trading settings updated successfully",
-    data: settings,
+    data: serializeSettings(current),
   });
 }

@@ -1,8 +1,8 @@
 import { Router } from "express";
 
-import * as marketController from "../controllers/marketController.js";
-import { asyncHandler } from "../utils/asyncHandler.js";
 import { auth } from "../middleware/auth.js";
+import { asyncHandler } from "../utils/asyncHandler.js";
+import * as marketController from "../controllers/marketController.js";
 
 const router = Router();
 
@@ -11,9 +11,14 @@ const router = Router();
 ============================================================ */
 
 /**
- * Get all available/active Deriv markets.
+ * GET /api/v1/markets
  *
- * GET /markets
+ * Returns all active markets currently available from Deriv.
+ *
+ * Optional query parameters can be added later for:
+ * - marketType
+ * - underlyingType
+ * - search
  */
 router.get(
   "/",
@@ -22,10 +27,12 @@ router.get(
 );
 
 /**
- * Refresh the market list.
+ * POST /api/v1/markets/refresh
  *
- * This currently retrieves fresh data using the same logic as list.
- * POST /markets/refresh
+ * Explicitly refreshes market data from Deriv.
+ *
+ * The backend remains responsible for caching and rate limiting
+ * external API requests.
  */
 router.post(
   "/refresh",
@@ -34,11 +41,12 @@ router.post(
 );
 
 /**
- * Get available contracts for a specific market.
+ * GET /api/v1/markets/:symbol/contracts
  *
- * GET /markets/:symbol/contracts
+ * Returns the contract types or contract metadata available for
+ * the requested Deriv market symbol.
  *
- * This route must be registered before /:symbol for clarity.
+ * IMPORTANT: This route must appear before "/:symbol".
  */
 router.get(
   "/:symbol/contracts",
@@ -47,9 +55,13 @@ router.get(
 );
 
 /**
- * Get details for a single market.
+ * GET /api/v1/markets/:symbol
  *
- * GET /markets/:symbol
+ * Returns details for one active Deriv market.
+ *
+ * Examples:
+ * - R_100
+ * - frxEURUSD
  */
 router.get(
   "/:symbol",

@@ -9,16 +9,16 @@ import * as balanceController from "../controllers/balanceController.js";
 const router = Router();
 
 /* ============================================================
-   DERIV CONNECTION
+   DERIV OAUTH CONNECTION
 ============================================================ */
 
 /**
  * Start the secure Deriv OAuth authorization flow.
  *
- * The frontend calls this endpoint and receives the authorization URL.
- *
- * GET is used here to remain compatible with the current frontend:
  * GET /api/v1/account/deriv/connect
+ *
+ * The authenticated user receives the Deriv authorization URL.
+ * The frontend should redirect the user to that URL.
  */
 router.get(
   "/connect",
@@ -27,21 +27,29 @@ router.get(
 );
 
 /**
- * OAuth callback from Deriv.
+ * Deriv OAuth callback.
  *
- * This route must NOT require the application's JWT because the
- * browser is redirected here directly by Deriv.
+ * GET /api/v1/account/deriv/callback
  *
- * Make sure this exact URL is registered as your OAuth redirect URI:
- * /api/v1/account/deriv/callback
+ * This endpoint intentionally does NOT use the application's auth
+ * middleware because the browser is redirected here by Deriv.
+ *
+ * The controller MUST validate the OAuth state and PKCE verifier
+ * before exchanging the authorization code.
  */
 router.get(
   "/callback",
   asyncHandler(derivAccountController.callback),
 );
 
+/* ============================================================
+   DERIV ACCOUNTS
+============================================================ */
+
 /**
- * Get all Deriv accounts connected by the authenticated user.
+ * Get all Deriv accounts connected to the authenticated user.
+ *
+ * GET /api/v1/account/deriv/accounts
  */
 router.get(
   "/accounts",
@@ -50,7 +58,13 @@ router.get(
 );
 
 /**
- * Select one REAL Deriv account for live auto-trading.
+ * Select the active Deriv account.
+ *
+ * POST /api/v1/account/deriv/select-account
+ *
+ * The request body and account ownership must be validated by
+ * the controller. Selecting an account does NOT authorize
+ * real-money automatic trading.
  */
 router.post(
   "/select-account",
@@ -59,7 +73,9 @@ router.post(
 );
 
 /**
- * Get the selected Deriv account and connection status.
+ * Get the currently selected Deriv account and connection status.
+ *
+ * GET /api/v1/account/deriv/connection
  */
 router.get(
   "/connection",
@@ -68,11 +84,16 @@ router.get(
 );
 
 /* ============================================================
-   BALANCE
+   ACCOUNT BALANCE
 ============================================================ */
 
 /**
- * Get the current/cached balance for the selected account.
+ * Get the balance of the currently selected account.
+ *
+ * GET /api/v1/account/deriv/balance
+ *
+ * The controller/service may return a recently cached balance or
+ * retrieve the current balance according to backend policy.
  */
 router.get(
   "/balance",
@@ -81,7 +102,9 @@ router.get(
 );
 
 /**
- * Explicitly refresh the selected account balance from Deriv.
+ * Explicitly request a fresh balance from Deriv.
+ *
+ * POST /api/v1/account/deriv/balance/refresh
  */
 router.post(
   "/balance/refresh",
@@ -94,7 +117,12 @@ router.post(
 ============================================================ */
 
 /**
- * Safely disconnect the user's Deriv account.
+ * Safely disconnect the user's selected Deriv connection.
+ *
+ * POST /api/v1/account/deriv/disconnect
+ *
+ * The controller should ensure that disconnecting an account cannot
+ * leave an active auto-trading worker running.
  */
 router.post(
   "/disconnect",

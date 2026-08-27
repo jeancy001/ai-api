@@ -11,7 +11,8 @@ const router = Router();
 ============================================================ */
 
 /**
- * Get the current trading status, settings, and selected account.
+ * Get the current trading engine status, trading settings,
+ * selected Deriv account, and authorization state.
  *
  * GET /api/v1/trading/status
  */
@@ -22,16 +23,16 @@ router.get(
 );
 
 /* ============================================================
-   REAL MONEY TRADING AUTHORIZATION
+   REAL-MONEY TRADING AUTHORIZATION
 ============================================================ */
 
 /**
- * Explicitly authorize real-money auto-trading.
+ * Explicitly authorize real-money automatic trading.
+ *
+ * This endpoint does NOT start the trading engine.
+ * The user must provide the required explicit confirmation.
  *
  * POST /api/v1/trading/authorize-real
- *
- * Requires explicit confirmation in the request body.
- * This does NOT start trading.
  */
 router.post(
   "/authorize-real",
@@ -40,17 +41,18 @@ router.post(
 );
 
 /* ============================================================
-   AUTO-TRADING CONTROL
+   AUTO-TRADING ENGINE
 ============================================================ */
 
 /**
  * Start automatic trading.
  *
- * The controller must verify:
- * - Explicit real-trading authorization exists.
- * - A selected Deriv account exists.
- * - The selected account is REAL.
- * - Emergency stop is not active.
+ * Backend validation includes:
+ * - authenticated user
+ * - explicit real-money authorization
+ * - selected REAL Deriv account
+ * - connected account
+ * - emergency stop is not active
  *
  * POST /api/v1/trading/start
  */
@@ -63,6 +65,9 @@ router.post(
 /**
  * Stop automatic trading normally.
  *
+ * Existing positions are monitored according to backend policy,
+ * but no new automated trades should be opened after this request.
+ *
  * POST /api/v1/trading/stop
  */
 router.post(
@@ -72,7 +77,10 @@ router.post(
 );
 
 /**
- * Immediately activate the emergency stop.
+ * Activate the emergency stop immediately.
+ *
+ * This blocks new automatic trades until the emergency stop
+ * is reset through a dedicated protected workflow.
  *
  * POST /api/v1/trading/emergency-stop
  */
@@ -87,7 +95,7 @@ router.post(
 ============================================================ */
 
 /**
- * Get the authenticated user's trade history.
+ * Get authenticated user's trade history.
  *
  * GET /api/v1/trading/trades?limit=50
  */
@@ -98,7 +106,7 @@ router.get(
 );
 
 /**
- * Get one specific trade belonging to the authenticated user.
+ * Get one trade belonging to the authenticated user.
  *
  * GET /api/v1/trading/trades/:id
  */

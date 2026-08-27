@@ -11,9 +11,12 @@ const router = Router();
 ============================================================ */
 
 /**
- * Get the authenticated user's trading settings.
- *
  * GET /api/v1/settings/trading
+ *
+ * Get the authenticated user's trading configuration.
+ *
+ * If settings do not exist yet, the controller may safely create
+ * default settings with auto-trading disabled.
  */
 router.get(
   "/trading",
@@ -22,13 +25,19 @@ router.get(
 );
 
 /**
- * Update allowed trading settings.
- *
  * PUT /api/v1/settings/trading
  *
- * The controller must whitelist editable fields and must never allow
- * sensitive server-side fields to be modified directly by the client,
- * such as realTradingAuthorized or emergencyStop.
+ * Update user-configurable trading and risk settings.
+ *
+ * The controller MUST whitelist fields and validate all values.
+ *
+ * Security-sensitive fields must never be directly writable by
+ * the frontend, including:
+ * - autoTradingEnabled
+ * - realTradingAuthorized
+ * - emergencyStop
+ * - stopReason
+ * - authorization timestamps
  */
 router.put(
   "/trading",
