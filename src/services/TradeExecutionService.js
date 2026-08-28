@@ -6,30 +6,26 @@ import { AppError } from "../utils/AppError.js";
 
 * TradeExecutionService
 *
-* Responsible only for execution-related operations:
+* Responsible only for broker execution:
+* * requesting validated proposals
+* * purchasing approved proposals
+* * recording confirmed purchases
 *
-* * Requesting a validated Deriv proposal
-* * Purchasing an already-approved proposal
-* * Persisting successful purchases
-*
-* IMPORTANT SECURITY ARCHITECTURE:
-*
-* This service does NOT decide whether a trade should happen.
-* Gemini/AI analysis, strategy validation, authorization, emergency
-* stop checks, and risk management must happen BEFORE this service
-* is allowed to execute a purchase.
-*
-* Gemini must never receive direct authority over the Deriv API.
+* IMPORTANT:
+* This service does NOT decide whether trading is allowed.
+* Authorization, Emergency Stop, AI analysis, strategy validation,
+* risk management, and final safety checks must happen before calling
+* the purchase methods.
   */
   export class TradeExecutionService {
   constructor() {
   /**
 
-  * Prevent accidental duplicate purchase requests for the same
-  * Deriv proposal inside this application instance.
+  * Prevent duplicate purchase requests for the same proposal inside
+  * this Node.js process.
   *
-  * Database-level idempotency is still handled separately when
-  * recording the resulting contract.
+  * Database idempotency is still required because multiple processes
+  * or deployment instances can exist.
     */
     this.purchaseLocks = new Set();
     }
@@ -38,27 +34,11 @@ import { AppError } from "../utils/AppError.js";
 PROPOSAL
 ============================================================ */
 
-/**
-
-* Request a proposal from Deriv.
-*
-* Contract parameters must already have been generated and
-* validated by trusted backend code.
-*
-* @param {string} accountId
-* @param {string} token
-* @param {object} params
-  */
-  async proposal(accountId, token, params) {
-  const normalizedAccountId = String(
-  accountId || ""
-  ).trim();
+async proposal(accountId, token, params) {
+const normalizedAccountId = String(accountId || "").trim();
 
 
 if (!normalizedAccountId) {
-
-
-
   throw new AppError(
     "Deriv account ID is required",
     400,
@@ -66,10 +46,7 @@ if (!normalizedAccountId) {
   );
 }
 
-if (
-  typeof token !== "string" ||
-  !token.trim()
-) {
+if (typeof token !== "string" || !token.trim()) {
   throw new AppError(
     "Deriv access token is required",
     401,
@@ -90,22 +67,21 @@ if (
 }
 
 /**
- * Never allow callers to override the proposal command.
+ * Prevent callers from overriding the Deriv command itself.
  */
 const {
   proposal: _ignoredProposal,
   ...contractParameters
 } = params;
 
-const msg =
-  await derivConnectionManager.request(
-    normalizedAccountId,
-    token,
-    {
-      proposal: 1,
-      ...contractParameters,
-    }
-  );
+const msg = await derivConnectionManager.request(
+  normalizedAccountId,
+  token,
+  {
+    proposal: 1,
+    ...contractParameters,
+  }
+);
 
 if (msg?.error) {
   throw new AppError(
@@ -160,29 +136,18 @@ return {
 PURCHASE
 ============================================================ */
 
-/**
-
-* Purchase an existing Deriv proposal.
-*
-* `price` represents the maximum price the backend is willing
-* to pay. It must come from trusted backend proposal data and
-* must never be supplied directly by Gemini or the frontend.
-  */
-  async buy({
-  accountId,
-  token,
-  proposalId,
-  price,
-  }) {
-  const normalizedAccountId = String(
-  accountId || ""
-  ).trim();
+async buy({
+accountId,
+token,
+proposalId,
+price,
+}) {
+const normalizedAccountId = String(
+accountId || ""
+).trim();
 
 
 const normalizedProposalId = String(
-
-
-
   proposalId || ""
 ).trim();
 
@@ -194,10 +159,7 @@ if (!normalizedAccountId) {
   );
 }
 
-if (
-  typeof token !== "string" ||
-  !token.trim()
-) {
+if (typeof token !== "string" || !token.trim()) {
   throw new AppError(
     "Deriv access token is required",
     401,
@@ -226,10 +188,6 @@ if (
   );
 }
 
-/**
- * A proposal should only be purchased once by this backend
- * instance. This protects against overlapping scheduler cycles.
- */
 const lockKey =
   `${normalizedAccountId}:${normalizedProposalId}`;
 
@@ -300,39 +258,24 @@ try {
 TRADE RECORDING
 ============================================================ */
 
-/**
-
-* Persist a purchased trade.
-*
-* Deriv contract IDs are treated as the broker-level source of
-* truth. Recording is idempotent to safely handle retries after
-* network or application failures.
-  */
-  async record(input) {
-  if (
-  !input ||
-  typeof input !== "object" ||
-  Array.isArray(input)
-  ) {
-  throw new AppError(
-  "Trade data is required",
-  400,
-  "TRADE_DATA_REQUIRED"
-  );
-  }
+async record(input) {
+if (
+!input ||
+typeof input !== "object" ||
+Array.isArray(input)
+) {
+throw new AppError(
+"Trade data is required",
+400,
+"TRADE_DATA_REQUIRED"
+);
+}
 
 
-const userId = String(
-
-
-
-  input.userId || ""
-).trim();
-
+const userId = String(input.userId || "").trim();
 const derivAccountId = String(
   input.derivAccountId || ""
 ).trim();
-
 const derivContractId = String(
   input.derivContractId || ""
 ).trim();
@@ -362,7 +305,7 @@ if (!derivContractId) {
 }
 
 /**
- * Check for an existing record before creating one.
+ * Fast path for normal retries.
  */
 const existing = await Trade.findOne({
   derivContractId,
@@ -383,8 +326,8 @@ try {
   });
 } catch (error) {
   /**
-   * Protect against concurrent inserts when MongoDB has a unique
-   * compound index on derivContractId + derivAccountId.
+   * A unique compound index is required for this to protect
+   * against concurrent application instances.
    */
   if (error?.code === 11000) {
     const duplicate = await Trade.findOne({
@@ -404,36 +347,25 @@ try {
 }
 
 /* ============================================================
-RECORD SUCCESSFUL PURCHASE
+RECORD CONFIRMED PURCHASE
 ============================================================ */
 
-/**
-
-* Convenience method for recording a successful Deriv purchase.
-*
-* This method is called only AFTER Deriv confirms the purchase.
-* Financial values are taken from trusted Deriv responses where
-* possible.
-  */
-  async recordPurchase({
-  userId,
-  accountId,
-  purchase,
-  proposal,
-  contractParameters = {},
-  analysis = null,
-  strategy = null,
-  entryPrice = null,
-  }) {
-  const contractId =
-  purchase?.contract_id ||
-  purchase?.contractId;
+async recordPurchase({
+userId,
+accountId,
+purchase,
+proposal,
+contractParameters = {},
+analysis = null,
+strategy = null,
+entryPrice = null,
+}) {
+const contractId =
+purchase?.contract_id ||
+purchase?.contractId;
 
 
 if (!contractId) {
-
-
-
   throw new AppError(
     "Cannot record a purchase without a contract ID",
     400,
@@ -441,16 +373,31 @@ if (!contractId) {
   );
 }
 
-const buyPrice = Number(
+/**
+ * buy_price is the actual broker-confirmed purchase amount when
+ * available. proposal.ask_price is only the proposal price.
+ */
+const actualBuyPrice = Number(
   purchase?.buy_price ??
   proposal?.ask_price ??
   0
 );
 
 const normalizedBuyPrice =
-  Number.isFinite(buyPrice) && buyPrice > 0
-    ? buyPrice
+  Number.isFinite(actualBuyPrice) &&
+  actualBuyPrice > 0
+    ? actualBuyPrice
     : null;
+
+const configuredStake = Number(
+  contractParameters.amount
+);
+
+const normalizedStake =
+  Number.isFinite(configuredStake) &&
+  configuredStake > 0
+    ? configuredStake
+    : normalizedBuyPrice;
 
 const market =
   contractParameters.symbol ||
@@ -465,19 +412,12 @@ return this.record({
 
   status: "open",
 
-  /**
-   * Keep both names compatible if your Trade model uses either
-   * `market` or `symbol`. Remove one if your schema strictly
-   * defines only one of them.
-   */
   market,
   symbol: market,
 
-  action:
-    analysis?.action ||
-    null,
+  action: analysis?.action || null,
 
-  stake: normalizedBuyPrice,
+  stake: normalizedStake,
   buyPrice: normalizedBuyPrice,
 
   entryPrice:
@@ -499,15 +439,10 @@ return this.record({
   openedAt: new Date(),
 
   metadata: {
-    proposalId:
-      proposal?.id
-        ? String(proposal.id)
-        : null,
+    proposalId: proposal?.id
+      ? String(proposal.id)
+      : null,
 
-    /**
-     * Gemini information is stored as analysis metadata only.
-     * It never represents execution authority.
-     */
     aiConfidence:
       Number.isFinite(
         Number(analysis?.confidence)
