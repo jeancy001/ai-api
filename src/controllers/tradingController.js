@@ -34,18 +34,79 @@ throw new AppError(
 return String(userId);
 }
 
-function serializeSettings(settings) {
-if (!settings) return null;
-
-return typeof settings.toObject === "function"
-? settings.toObject()
-: { ...settings };
-}
-
 function normalizeText(value) {
 return String(value || "")
 .trim()
 .toLowerCase();
+}
+
+function serializeSettings(settings) {
+if (!settings) return null;
+
+const data =
+typeof settings.toObject === "function"
+? settings.toObject()
+: { ...settings };
+
+// Explicitly return only fields the frontend needs.
+return {
+userId: data.userId,
+
+
+selectedMarket: data.selectedMarket || null,
+contractType: data.contractType || null,
+contractDuration: data.contractDuration ?? null,
+contractDurationUnit:
+  data.contractDurationUnit || null,
+stakeBasis: data.stakeBasis || "stake",
+
+autoTradingEnabled:
+  data.autoTradingEnabled === true,
+
+realTradingAuthorized:
+  data.realTradingAuthorized === true,
+
+realTradingAuthorizedAt:
+  data.realTradingAuthorizedAt || null,
+
+emergencyStop:
+  data.emergencyStop === true,
+
+emergencyStoppedAt:
+  data.emergencyStoppedAt || null,
+
+emergencyReleasedAt:
+  data.emergencyReleasedAt || null,
+
+stake: data.stake,
+maxStake: data.maxStake,
+minimumBalance: data.minimumBalance,
+
+maxDailyLoss: data.maxDailyLoss,
+maxDailyTrades: data.maxDailyTrades,
+maxConsecutiveLosses:
+  data.maxConsecutiveLosses,
+
+aiConfidenceThreshold:
+  data.aiConfidenceThreshold,
+
+tradingIntervalMs:
+  data.tradingIntervalMs,
+
+analysisInterval:
+  data.analysisInterval,
+
+cooldown: data.cooldown,
+
+stopReason: data.stopReason || null,
+startedAt: data.startedAt || null,
+stoppedAt: data.stoppedAt || null,
+
+createdAt: data.createdAt || null,
+updatedAt: data.updatedAt || null,
+
+
+};
 }
 
 function isAccountConnected(account) {
@@ -115,18 +176,19 @@ throw new AppError(
 );
 }
 
-if (includeToken) {
 if (
+includeToken &&
+(
 typeof account.encryptedAccessToken !==
 "string" ||
 !account.encryptedAccessToken.trim()
+)
 ) {
 throw new AppError(
 "The selected Deriv account does not have valid credentials. Please reconnect your account.",
 401,
 "DERIV_TOKEN_MISSING"
 );
-}
 }
 
 return account;
@@ -163,7 +225,7 @@ throw new AppError(
 }
 
 /* ============================================================
-SERIALIZE VERIFIED LIVE BALANCE
+LIVE BALANCE
 ============================================================ */
 
 function serializeLiveBalance(account, liveBalance) {
@@ -180,22 +242,17 @@ throw new AppError(
 
 const rawBalance = liveBalance.balance;
 
-/*
-
-* Never convert a missing balance into zero.
-* A real zero balance is valid when explicitly returned by Deriv.
-  */
-  if (
-  rawBalance === undefined ||
-  rawBalance === null ||
-  rawBalance === ""
-  ) {
-  throw new AppError(
-  "Deriv did not return a balance for the selected account",
-  502,
-  "DERIV_LIVE_BALANCE_MISSING"
-  );
-  }
+if (
+rawBalance === undefined ||
+rawBalance === null ||
+rawBalance === ""
+) {
+throw new AppError(
+"Deriv did not return a balance for the selected account",
+502,
+"DERIV_LIVE_BALANCE_MISSING"
+);
+}
 
 const amount = Number(rawBalance);
 
@@ -214,21 +271,17 @@ liveBalance.loginId ??
 liveBalance.account_id ??
 null;
 
-/*
-
-* Never expose a balance returned for another account.
-  */
-  if (
-  responseAccountId !== null &&
-  String(responseAccountId).trim() !==
-  String(account.derivAccountId).trim()
-  ) {
-  throw new AppError(
-  "Deriv returned balance information for a different account",
-  403,
-  "DERIV_BALANCE_ACCOUNT_MISMATCH"
-  );
-  }
+if (
+responseAccountId !== null &&
+String(responseAccountId).trim() !==
+String(account.derivAccountId).trim()
+) {
+throw new AppError(
+"Deriv returned balance information for a different account",
+403,
+"DERIV_BALANCE_ACCOUNT_MISMATCH"
+);
+}
 
 const currency =
 typeof liveBalance.currency === "string" &&
@@ -242,51 +295,25 @@ account.currency.trim()
 return {
 balance: amount,
 currency,
-
-
 accountId: String(account.derivAccountId),
 derivAccountId: String(account.derivAccountId),
-
 accountType: "real",
 source: "deriv_live",
-
 updatedAt:
-  typeof liveBalance.updatedAt === "string"
-    ? liveBalance.updatedAt
-    : new Date().toISOString(),
-
-
+typeof liveBalance.updatedAt === "string"
+? liveBalance.updatedAt
+: new Date().toISOString(),
 };
 }
 
-/* ============================================================
-FETCH CURRENT LIVE BALANCE FROM DERIV
-
-MongoDB is used only to:
-
-* identify the selected account
-* verify ownership
-* retrieve encrypted credentials
-
-The actual balance ALWAYS comes directly from Deriv.
-============================================================ */
-
-async function fetchLiveDerivBalance(userId) {
-const account =
-await getSelectedRealAccountOrThrow(userId, {
-includeToken: true,
-});
-
-const accessToken =
-getAccessToken(account);
+async function fetchLiveBalanceFromAccount(account) {
+const accessToken = getAccessToken(account);
 
 const liveBalance =
 await derivBalanceService.get(
 String(account.derivAccountId),
 accessToken,
-{
-subscribe: false,
-}
+{ subscribe: false }
 );
 
 if (!liveBalance) {
@@ -297,21 +324,27 @@ throw new AppError(
 );
 }
 
-return {
-account,
-balance: serializeLiveBalance(
+return serializeLiveBalance(
 account,
 liveBalance
-),
-};
+);
 }
 
-/* ============================================================
-BEST-EFFORT LIVE BALANCE FOR STATUS
+async function fetchLiveDerivBalance(userId) {
+const account =
+await getSelectedRealAccountOrThrow(
+userId,
+{ includeToken: true }
+);
 
-The trading status endpoint should still return engine state if
-Deriv is temporarily unavailable. It NEVER returns a fake balance.
-============================================================ */
+const balance =
+await fetchLiveBalanceFromAccount(account);
+
+return {
+account,
+balance,
+};
+}
 
 async function getLiveBalanceForStatus(
 userId,
@@ -331,38 +364,35 @@ error: "NO_SELECTED_ACCOUNT",
 };
 }
 
-/*
-
-* Do not attempt a live request for a non-real/disconnected account.
-  */
-  if (
-  normalizeText(selectedAccount.accountType) !==
-  "real" ||
-  !isAccountConnected(selectedAccount)
-  ) {
-  return {
-  balance: null,
-  currency:
-  selectedAccount.currency || null,
-  accountId:
-  selectedAccount.derivAccountId || null,
-  derivAccountId:
-  selectedAccount.derivAccountId || null,
-  accountType:
-  selectedAccount.accountType || null,
-  source: null,
-  updatedAt: null,
-  available: false,
-  error:
-  normalizeText(
-  selectedAccount.accountType
-  ) !== "real"
-  ? "REAL_ACCOUNT_REQUIRED"
-  : "DERIV_ACCOUNT_NOT_CONNECTED",
-  };
-  }
+if (
+normalizeText(selectedAccount.accountType) !==
+"real" ||
+!isAccountConnected(selectedAccount)
+) {
+return {
+balance: null,
+currency:
+selectedAccount.currency || null,
+accountId:
+selectedAccount.derivAccountId || null,
+derivAccountId:
+selectedAccount.derivAccountId || null,
+accountType:
+selectedAccount.accountType || null,
+source: null,
+updatedAt: null,
+available: false,
+error:
+normalizeText(selectedAccount.accountType) !==
+"real"
+? "REAL_ACCOUNT_REQUIRED"
+: "DERIV_ACCOUNT_NOT_CONNECTED",
+};
+}
 
 try {
+// Reload with token because the status query intentionally
+// does not expose credentials.
 const { balance } =
 await fetchLiveDerivBalance(userId);
 
@@ -410,20 +440,10 @@ ENGINE STATE
 
 function isEngineRunning(userId) {
 try {
-if (
-!autoTradingService ||
-typeof autoTradingService.isRunning !==
-"function"
-) {
-return false;
-}
-
-
 return (
-  autoTradingService.isRunning(userId) === true
+autoTradingService?.isRunning?.(userId) ===
+true
 );
-
-
 } catch (error) {
 console.error(
 "Unable to determine trading engine state:",
@@ -481,9 +501,7 @@ stoppedAt: null,
 
 async function getSettings(userId) {
 let settings =
-await TradingSettings.findOne({
-userId,
-});
+await TradingSettings.findOne({ userId });
 
 if (!settings) {
 settings =
@@ -530,27 +548,22 @@ async function stopEngineSafely(
 userId,
 reason
 ) {
+try {
 if (
-!autoTradingService ||
-typeof autoTradingService.stop !==
+typeof autoTradingService?.stop !==
 "function"
 ) {
 console.warn(
 "AutoTradingService.stop() is not available"
 );
-
-
 return false;
-
-
 }
 
-try {
-await autoTradingService.stop(
-userId,
-reason
-);
 
+await autoTradingService.stop(
+  userId,
+  reason
+);
 
 return true;
 
@@ -570,8 +583,7 @@ return false;
 
 async function startEngineOrThrow(userId) {
 if (
-!autoTradingService ||
-typeof autoTradingService.start !==
+typeof autoTradingService?.start !==
 "function"
 ) {
 throw new Error(
@@ -582,37 +594,20 @@ throw new Error(
 const result =
 await autoTradingService.start(userId);
 
-if (result?.started === false) {
-const reason = result?.reason;
-
-
-/*
- * Start is idempotent.
- */
-if (reason !== "ALREADY_RUNNING") {
-  throw new Error(
-    reason ||
-      "The trading engine could not start"
-  );
-}
-
-
-}
-
 if (
-typeof autoTradingService.isRunning ===
-"function"
+result?.started === false &&
+result?.reason !== "ALREADY_RUNNING"
 ) {
-const running = isEngineRunning(userId);
-
-
-if (!running) {
-  throw new Error(
-    "The trading engine did not remain running after startup"
-  );
+throw new Error(
+result?.reason ||
+"The trading engine could not start"
+);
 }
 
-
+if (!isEngineRunning(userId)) {
+throw new Error(
+"The trading engine did not remain running after startup"
+);
 }
 
 return result;
@@ -649,28 +644,17 @@ return {
 running: engineRunning,
 active,
 state,
-
-
 stateMismatch:
-  (enabled &&
-    !emergencyActive &&
-    !engineRunning) ||
-  (!enabled && engineRunning),
-
-
+(enabled &&
+!emergencyActive &&
+!engineRunning) ||
+(!enabled && engineRunning),
 };
 }
 
 /* ============================================================
 GET /trading/status
-
-Returns:
-
-* trading settings
-* engine state
-* selected account
-* CURRENT verified balance directly from Deriv
-  ============================================================ */
+============================================================ */
 
 export async function status(req, res) {
 const userId = getUserId(req);
@@ -678,33 +662,33 @@ const userId = getUserId(req);
 const [settings, account] =
 await Promise.all([
 getSettings(userId),
-
-
-  DerivAccount.findOne({
-    userId,
-    selected: true,
-  })
-    .select(
-      [
-        "derivAccountId",
-        "accountType",
-        "currency",
-        "selected",
-        "connected",
-        "connectionStatus",
-        "lastVerifiedAt",
-      ].join(" ")
-    )
-    .lean(),
+DerivAccount.findOne({
+userId,
+selected: true,
+})
+.select(
+[
+"derivAccountId",
+"accountType",
+"currency",
+"selected",
+"connected",
+"connectionStatus",
+"lastVerifiedAt",
+].join(" ")
+)
+.lean(),
 ]);
 
-
-const [
-balance,
-engineRunning,
-] = await Promise.all([
-getLiveBalanceForStatus(userId, account),
-Promise.resolve(isEngineRunning(userId)),
+const [balance, engineRunning] =
+await Promise.all([
+getLiveBalanceForStatus(
+userId,
+account
+),
+Promise.resolve(
+isEngineRunning(userId)
+),
 ]);
 
 const engine = buildEngineState(
@@ -717,63 +701,36 @@ const accountData = account
 accountId: account.derivAccountId,
 derivAccountId:
 account.derivAccountId,
-
-
-    accountType: account.accountType,
-
-    currency:
-      balance.currency ||
-      account.currency ||
-      null,
-
-    selected:
-      account.selected === true,
-
-    connected:
-      isAccountConnected(account),
-
-    connectionStatus:
-      account.connectionStatus ||
-      (isAccountConnected(account)
-        ? "connected"
-        : "disconnected"),
-
-    lastVerifiedAt:
-      account.lastVerifiedAt || null,
-
-    /*
-     * Convenience fields. The source remains data.balance.
-     */
-    balance: balance.balance,
-    currentBalance: balance.balance,
-  }
+accountType: account.accountType,
+currency:
+balance.currency ||
+account.currency ||
+null,
+selected:
+account.selected === true,
+connected:
+isAccountConnected(account),
+connectionStatus:
+account.connectionStatus ||
+(isAccountConnected(account)
+? "connected"
+: "disconnected"),
+lastVerifiedAt:
+account.lastVerifiedAt || null,
+balance: balance.balance,
+currentBalance: balance.balance,
+}
 : null;
-
 
 return res.status(200).json({
 success: true,
 data: {
 settings: serializeSettings(settings),
 engine,
-
-
-  /*
-   * Primary live balance response.
-   *
-   * Frontend:
-   * response.data.balance.balance
-   */
-  balance,
-
-  /*
-   * Backward-compatible convenience field.
-   */
-  currentBalance: balance.balance,
-
-  account: accountData,
+balance,
+currentBalance: balance.balance,
+account: accountData,
 },
-
-
 });
 }
 
@@ -789,7 +746,10 @@ typeof req.body?.confirmation === "string"
 ? req.body.confirmation.trim()
 : "";
 
-if (confirmation !== REAL_AUTH_CONFIRMATION) {
+if (
+confirmation !==
+REAL_AUTH_CONFIRMATION
+) {
 throw new AppError(
 `Explicit confirmation is required. Please confirm with: ${REAL_AUTH_CONFIRMATION}`,
 400,
@@ -840,7 +800,9 @@ POST /trading/start
 export async function start(req, res) {
 const userId = getUserId(req);
 
-const settings = await getSettings(userId);
+const settings =
+await getSettings(userId);
+
 const engineRunningBefore =
 isEngineRunning(userId);
 
@@ -864,38 +826,37 @@ const account =
 await getSelectedRealAccountOrThrow(userId);
 
 const market =
-await validateSelectedMarketOrThrow(
-settings
-);
+await validateSelectedMarketOrThrow(settings);
 
-/*
+if (
+settings.autoTradingEnabled === true &&
+engineRunningBefore === true
+) {
+return res.status(200).json({
+success: true,
+message:
+"Auto-trading is already running.",
+data: {
+...serializeSettings(settings),
+engine: buildEngineState(
+settings,
+true
+),
+},
+});
+}
 
-* Fully idempotent start.
-  */
-  if (
-  settings.autoTradingEnabled === true &&
-  engineRunningBefore === true
-  ) {
-  return res.status(200).json({
-  success: true,
-  message:
-  "Auto-trading is already running.",
-  data: serializeSettings(settings),
-  });
-  }
+const wasEnabledBefore =
+settings.autoTradingEnabled === true;
 
-/*
-
-* Recover from a backend restart where MongoDB says enabled but
-* the process-local scheduler no longer exists.
-  */
-  const recoveringEngine =
-  settings.autoTradingEnabled === true &&
-  engineRunningBefore === false;
+const recoveringEngine =
+wasEnabledBefore &&
+engineRunningBefore === false;
 
 settings.autoTradingEnabled = true;
 settings.stopReason = null;
-settings.startedAt = new Date();
+settings.startedAt =
+settings.startedAt || new Date();
 settings.stoppedAt = null;
 
 await settings.save();
@@ -903,25 +864,41 @@ await settings.save();
 try {
 await startEngineOrThrow(userId);
 } catch (error) {
-settings.autoTradingEnabled = false;
-settings.stopReason =
-"ENGINE_START_FAILED";
-settings.stoppedAt = new Date();
+/*
+* Preserve the persisted enabled state during a recovery
+* attempt. A temporary process failure should not silently
+* change the user's intended trading state.
+*/
+settings.autoTradingEnabled =
+wasEnabledBefore;
 
+
+settings.stopReason =
+  recoveringEngine
+    ? "ENGINE_RECOVERY_FAILED"
+    : "ENGINE_START_FAILED";
+
+settings.stoppedAt =
+  recoveringEngine
+    ? settings.stoppedAt
+    : new Date();
 
 await settings.save();
 
 await logActivitySafe({
   userId,
   type: "AUTO_TRADING_START_FAILED",
-  title: "Auto-trading failed to start",
+  title: recoveringEngine
+    ? "Auto-trading recovery failed"
+    : "Auto-trading failed to start",
   description:
     error?.message ||
     "The automatic trading engine could not start.",
   metadata: {
     accountId: account.derivAccountId,
     market: settings.selectedMarket,
-    recoveryAttempt: recoveringEngine,
+    recoveryAttempt:
+      recoveringEngine,
   },
 });
 
@@ -929,7 +906,9 @@ throw new AppError(
   error?.message ||
     "Unable to start the auto-trading engine",
   500,
-  "AUTO_TRADING_START_FAILED"
+  recoveringEngine
+    ? "AUTO_TRADING_RECOVERY_FAILED"
+    : "AUTO_TRADING_START_FAILED"
 );
 
 
@@ -965,13 +944,10 @@ message: recoveringEngine
 : "Auto-trading started successfully. HOLD or skipped analysis cycles will not stop the engine.",
 data: {
 ...serializeSettings(settings),
-engine: {
-running: engineRunningAfter,
-active:
-settings.autoTradingEnabled === true &&
-settings.emergencyStop !== true &&
-engineRunningAfter,
-},
+engine: buildEngineState(
+settings,
+engineRunningAfter
+),
 },
 });
 }
@@ -986,7 +962,9 @@ Never activates Emergency Stop.
 export async function stop(req, res) {
 const userId = getUserId(req);
 
-const settings = await getSettings(userId);
+const settings =
+await getSettings(userId);
+
 const engineRunning =
 isEngineRunning(userId);
 
@@ -1047,7 +1025,8 @@ ONLY this endpoint activates the persistent Emergency Stop lock.
 export async function emergency(req, res) {
 const userId = getUserId(req);
 
-const settings = await getSettings(userId);
+const settings =
+await getSettings(userId);
 
 const wasAlreadyActive =
 settings.emergencyStop === true;
@@ -1099,8 +1078,6 @@ alreadyActive: wasAlreadyActive,
 
 /* ============================================================
 POST /trading/release-emergency-stop
-
-Releases the emergency lock but NEVER starts trading automatically.
 ============================================================ */
 
 export async function releaseEmergencyStop(
@@ -1109,7 +1086,8 @@ res
 ) {
 const userId = getUserId(req);
 
-const settings = await getSettings(userId);
+const settings =
+await getSettings(userId);
 
 if (settings.emergencyStop !== true) {
 return res.status(200).json({
@@ -1165,9 +1143,8 @@ GET /trading/trades
 export async function trades(req, res) {
 const userId = getUserId(req);
 
-const requestedLimit = Number(
-req.query.limit
-);
+const requestedLimit =
+Number(req.query.limit);
 
 const limit = Number.isFinite(
 requestedLimit
