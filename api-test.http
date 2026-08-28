@@ -1,0 +1,381 @@
+@baseUrl = http://localhost:5000/api/v1
+@token = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjZhOTAwYjZlZmNlMGRmNzAxY2ZlNDM3YiIsInN1YiI6IjZhOTAwYjZlZmNlMGRmNzAxY2ZlNDM3YiIsImVtYWlsIjoiamVhbmN5bXBveTI0QGdtYWlsLmNvbSIsInR5cGUiOiJhY2Nlc3MiLCJpYXQiOjE3ODc5MDYwNzcsImV4cCI6MTc4ODUxMDg3N30._kXPtUMnFl0r5EuSbXB0liebIsN0iTJq-1JP0w0jlJE
+
+# Use a real symbol returned by GET /markets.
+
+# Examples depend on what Deriv returns for your account/environment.
+
+@symbol = R_100
+
+###
+
+# ============================================================
+
+# DERIV MARKETS API TESTS
+
+# ============================================================
+
+#
+
+# IMPORTANT:
+
+# All market routes require authentication.
+
+# Replace @token with a valid JWT token obtained from /auth/login.
+
+#
+
+# Base routes:
+
+# GET    /markets
+
+# POST   /markets/refresh
+
+# GET    /markets/prices
+
+# GET    /markets/:symbol
+
+# GET    /markets/:symbol/price
+
+# GET    /markets/:symbol/candles
+
+# GET    /markets/:symbol/contracts
+
+#
+
+# ============================================================
+
+###
+
+# ============================================================
+
+# 1. LOGIN - GET JWT TOKEN
+
+# ============================================================
+
+POST {{baseUrl}}/auth/login
+Content-Type: application/json
+
+{
+"email": "jeancympoy24@gmail.com",
+"password": "Jeancy01@"
+}
+
+###
+
+# ============================================================
+
+# 2. GET ALL REAL DERIV MARKETS
+
+# Route: GET /markets
+
+# ============================================================
+
+GET {{baseUrl}}/markets
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 3. GET MARKETS WITH LIMIT
+
+# Route: GET /markets?limit=20
+
+# ============================================================
+
+GET {{baseUrl}}/markets?limit=20
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 4. SEARCH MARKETS
+
+# Route: GET /markets?search=...
+
+# ============================================================
+
+GET {{baseUrl}}/markets?search=Volatility
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 5. FILTER MARKETS BY MARKET CATEGORY
+
+# Route: GET /markets?market=...
+
+# ============================================================
+
+GET {{baseUrl}}/markets?market=synthetic_index
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 6. REFRESH REAL DERIV MARKET CATALOGUE
+
+# Route: POST /markets/refresh
+
+# ============================================================
+
+POST {{baseUrl}}/markets/refresh
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 7. GET ALL AVAILABLE LIVE PRICES
+
+# Route: GET /markets/prices
+
+#
+
+# IMPORTANT:
+
+# This static route must work before /:symbol.
+
+# ============================================================
+
+GET {{baseUrl}}/markets/prices
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 8. GET LIVE PRICES WITH LIMIT
+
+# Route: GET /markets/prices?limit=50
+
+# ============================================================
+
+GET {{baseUrl}}/markets/prices?limit=50
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 9. GET ONE REAL MARKET
+
+# Route: GET /markets/:symbol
+
+# ============================================================
+
+GET {{baseUrl}}/markets/{{symbol}}
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 10. GET ONE REAL LIVE MARKET PRICE
+
+# Route: GET /markets/:symbol/price
+
+# ============================================================
+
+GET {{baseUrl}}/markets/{{symbol}}/price
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 11. GET MARKET CANDLES - DEFAULT
+
+# Route: GET /markets/:symbol/candles
+
+# ============================================================
+
+GET {{baseUrl}}/markets/{{symbol}}/candles
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 12. GET 100 ONE-MINUTE CANDLES
+
+#
+
+# This matches your frontend:
+
+# backend.marketCandles(symbol, {
+
+# granularity: 60,
+
+# count: 100
+
+# })
+
+# ============================================================
+
+GET {{baseUrl}}/markets/{{symbol}}/candles?granularity=60&count=100
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 13. GET 50 FIVE-MINUTE CANDLES
+
+# ============================================================
+
+GET {{baseUrl}}/markets/{{symbol}}/candles?granularity=300&count=50
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 14. GET MARKET CANDLES WITH TIME RANGE
+
+#
+
+# Replace start/end with Unix timestamps when needed.
+
+# ============================================================
+
+GET {{baseUrl}}/markets/{{symbol}}/candles?granularity=60&count=100&start=1700000000&end=1700006000
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# 15. GET AVAILABLE CONTRACT TYPES FOR A MARKET
+
+# Route: GET /markets/:symbol/contracts
+
+# ============================================================
+
+GET {{baseUrl}}/markets/{{symbol}}/contracts
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# ERROR & SECURITY TESTS
+
+# ============================================================
+
+###
+
+# 16. UNAUTHORIZED REQUEST
+
+# Expected: 401 Unauthorized
+
+# ============================================================
+
+GET {{baseUrl}}/markets
+
+###
+
+# 17. INVALID JWT TOKEN
+
+# Expected: 401 Unauthorized
+
+# ============================================================
+
+GET {{baseUrl}}/markets
+Authorization: Bearer invalid-token
+Accept: application/json
+
+###
+
+# 18. INVALID MARKET SYMBOL
+
+# Expected: 400 or 404 depending on your controller
+
+# ============================================================
+
+GET {{baseUrl}}/markets/INVALID_SYMBOL_12345
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# 19. INVALID MARKET PRICE SYMBOL
+
+# Expected: 400 or 404
+
+# ============================================================
+
+GET {{baseUrl}}/markets/INVALID_SYMBOL_12345/price
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# 20. INVALID CANDLE PARAMETERS
+
+# Expected: 400 validation error if validation is implemented
+
+# ============================================================
+
+GET {{baseUrl}}/markets/{{symbol}}/candles?granularity=invalid&count=-10
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# ============================================================
+
+# ROUTE ORDER TEST
+
+# ============================================================
+
+#
+
+# These two requests verify that Express correctly matches
+
+# /prices before the dynamic /:symbol route.
+
+#
+
+# Expected:
+
+# - /prices       -> marketController.prices
+
+# - /R_100        -> marketController.one
+
+# ============================================================
+
+###
+
+# Static route test
+
+GET {{baseUrl}}/markets/prices
+Authorization: Bearer {{token}}
+Accept: application/json
+
+###
+
+# Dynamic route test
+
+GET {{baseUrl}}/markets/{{symbol}}
+Authorization: Bearer {{token}}
+Accept: application/json
