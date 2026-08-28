@@ -4,9 +4,22 @@ import { AppError } from "../utils/AppError.js";
  * TradingStrategyService
  *
  * IMPORTANT:
- * This service validates whether an analysis signal is eligible to
- * continue through the trading pipeline. It does NOT execute trades
- * and does NOT bypass risk management.
+ * This service decides only whether an AI/strategy signal is eligible
+ * to continue through the current trading pipeline.
+ *
+ * A rejected signal is a NORMAL trading outcome. It must NOT:
+ * - activate Emergency Stop
+ * - disable real-money authorization
+ * - permanently stop the trading engine
+ *
+ * Examples of normal rejections:
+ * - HOLD signal
+ * - low confidence
+ * - stale market data
+ * - invalid signal data
+ *
+ * Emergency Stop is controlled separately by an explicit safety action
+ * or a dedicated backend safety mechanism.
  *
  * Final trade authorization must still be performed by:
  * - Trading settings checks
@@ -18,6 +31,9 @@ import { AppError } from "../utils/AppError.js";
 export class TradingStrategyService {
   /**
    * Validate an AI/strategy signal against the available market data.
+   *
+   * A validation failure means "DO NOT TRADE THIS CYCLE".
+   * It does NOT mean "EMERGENCY STOP".
    *
    * @param {object} signal - Analysis result.
    * @param {object} market - Latest market tick/data.
@@ -35,13 +51,14 @@ export class TradingStrategyService {
 
     /**
      * Validate signal structure defensively.
+     *
+     * This is a normal rejection for the current cycle.
      */
     if (!signal || typeof signal !== "object") {
-      return {
-        approved: false,
-        reasons: ["INVALID_TRADING_SIGNAL"],
-        warnings,
-      };
+      return this.createRejectedResult(
+        ["INVALID_TRADING_SIGNAL"],
+        warnings
+      );
     }
 
     const action = String(signal.action || "")
@@ -53,7 +70,10 @@ export class TradingStrategyService {
     }
 
     /**
-     * HOLD is never a trade instruction.
+     * HOLD is a valid analysis outcome.
+     *
+     * It simply means no trade should be opened during this cycle.
+     * It must never activate Emergency Stop.
      */
     if (action === "HOLD") {
       reasons.push("AI_HOLD");
@@ -75,10 +95,10 @@ export class TradingStrategyService {
     }
 
     /**
-     * Market data must exist and contain a valid positive quote.
+     * Market data validation.
      *
-     * Do not use `if (!market.quote)` because a numeric validation
-     * is safer and makes the reason explicit.
+     * Invalid or unavailable market data means this cycle is skipped.
+     * The trading engine may safely wait for fresh data and try again.
      */
     if (!market || typeof market !== "object") {
       reasons.push("NO_FRESH_MARKET_DATA");
@@ -90,20 +110,19 @@ export class TradingStrategyService {
       }
 
       /**
-       * Ensure the returned tick belongs to the expected symbol when
-       * both values are available.
+       * Ensure the returned tick belongs to the expected symbol.
        */
       if (
         expectedSymbol &&
         market.symbol &&
-        String(market.symbol) !== String(expectedSymbol)
+        String(market.symbol).trim().toUpperCase() !==
+          String(expectedSymbol).trim().toUpperCase()
       ) {
         reasons.push("MARKET_SYMBOL_MISMATCH");
       }
 
       /**
-       * Reject stale market data when the tick provides an epoch.
-       * Deriv ticks commonly use epoch in seconds.
+       * Deriv ticks commonly provide epoch in seconds.
        */
       if (market.epoch !== undefined && market.epoch !== null) {
         const epoch = Number(market.epoch);
@@ -117,8 +136,9 @@ export class TradingStrategyService {
           }
 
           /**
-           * A significantly future timestamp can indicate invalid data
-           * or clock problems. Don't silently trade on it.
+           * Future timestamps indicate invalid data or a clock issue.
+           * Reject the current cycle rather than treating it as an
+           * emergency.
            */
           if (ageMs < -60_000) {
             reasons.push("INVALID_MARKET_TIMESTAMP");
@@ -132,20 +152,17 @@ export class TradingStrategyService {
     }
 
     /**
-     * Ensure the signal is for the market currently being evaluated.
+     * Ensure the signal belongs to the market currently evaluated.
      */
     if (
       expectedSymbol &&
       signal.market &&
-      String(signal.market) !== String(expectedSymbol)
+      String(signal.market).trim().toUpperCase() !==
+        String(expectedSymbol).trim().toUpperCase()
     ) {
       reasons.push("SIGNAL_MARKET_MISMATCH");
     }
 
-    /**
-     * A reason is useful for auditability, but absence of a reason
-     * should not be confused with permission to execute.
-     */
     const approved = reasons.length === 0;
 
     return {
@@ -158,9 +175,47 @@ export class TradingStrategyService {
       warnings,
 
       /**
-       * This means only that the strategy validation passed.
-       * It is NOT final authorization to execute a real trade.
+       * A rejected strategy signal only skips the current trade cycle.
+       *
+       * The engine can continue monitoring the market and evaluate
+       * the next valid signal.
        */
+      shouldSkipCycle: !approved,
+
+      /**
+       * Strategy validation NEVER requests Emergency Stop.
+       *
+       * Emergency state must be managed explicitly elsewhere.
+       */
+      emergencyStopRequested: false,
+
+      /**
+       * This service never gives final execution authorization.
+       */
+      executionAuthorized: false,
+    };
+  }
+
+  /**
+   * Create a consistent normal rejection response.
+   *
+   * This is intentionally NOT an emergency response.
+   */
+  createRejectedResult(reasons, warnings = []) {
+    return {
+      approved: false,
+      action: null,
+      confidence: null,
+      reasons,
+      warnings,
+
+      // Skip only the current cycle.
+      shouldSkipCycle: true,
+
+      // Never activate emergency stop from strategy validation.
+      emergencyStopRequested: false,
+
+      // Final execution authorization belongs elsewhere.
       executionAuthorized: false,
     };
   }
@@ -211,7 +266,8 @@ export class TradingStrategyService {
 
     if (
       !contractType ||
-      typeof contractType !== "string"
+      typeof contractType !== "string" ||
+      !contractType.trim()
     ) {
       throw new AppError(
         "A contract type must be explicitly configured",

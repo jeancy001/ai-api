@@ -7,8 +7,9 @@ import { AppError } from "../utils/AppError.js";
 
 * Maximum time allowed for one Gemini analysis request.
 *
-* If Gemini does not respond within this period, the automated
-* trading engine receives a safe HOLD signal.
+* A Gemini timeout or temporary failure does NOT activate Emergency Stop.
+* The trading cycle simply receives a safe HOLD signal and waits for the
+* next scheduled cycle.
   */
   const AI_TIMEOUT_MS = 20_000;
 
@@ -120,7 +121,7 @@ if (Array.isArray(value)) {
 return value
 .slice(0, MAX_CONTEXT_ITEMS)
 .map((item) =>
-sanitizeValue(item, depth + 1),
+sanitizeValue(item, depth + 1)
 );
 }
 
@@ -134,7 +135,7 @@ Object.entries(value)
 .map(([key, item]) => [
 String(key).slice(0, 100),
 sanitizeValue(item, depth + 1),
-]),
+])
 );
 }
 
@@ -152,7 +153,7 @@ if (!text || typeof text !== "string") {
 throw new AppError(
 "Gemini returned an empty response",
 502,
-"GEMINI_EMPTY_RESPONSE",
+"GEMINI_EMPTY_RESPONSE"
 );
 }
 
@@ -167,7 +168,7 @@ if (!cleaned) {
 throw new AppError(
 "Gemini returned an empty response",
 502,
-"GEMINI_EMPTY_RESPONSE",
+"GEMINI_EMPTY_RESPONSE"
 );
 }
 
@@ -177,22 +178,22 @@ return JSON.parse(cleaned);
 throw new AppError(
 "Gemini returned invalid JSON",
 502,
-"GEMINI_INVALID_JSON",
+"GEMINI_INVALID_JSON"
 );
 }
 }
 
 /**
 
-* Reject the caller after timeout.
+* Reject waiting after the configured timeout.
 *
-* Note: Promise.race cannot necessarily cancel the underlying SDK
-* request, but it prevents the trading cycle from waiting forever.
+* A timeout does NOT activate Emergency Stop. It only prevents one
+* analysis request from blocking the current trading cycle forever.
   */
   function withTimeout(
   promise,
   timeoutMs,
-  message,
+  message
   ) {
   let timer;
 
@@ -203,11 +204,11 @@ reject(
 new AppError(
 message,
 504,
-"GEMINI_TIMEOUT",
-),
+"GEMINI_TIMEOUT"
+)
 );
 }, timeoutMs);
-},
+}
 );
 
 return Promise.race([
@@ -226,53 +227,40 @@ GEMINI TRADING ANALYSIS SERVICE
 
 /**
 
-* Gemini provides the AI trading signal.
+* Gemini provides market analysis only.
 *
-* Flow:
+* IMPORTANT:
+* * Gemini cannot activate Emergency Stop.
+* * Gemini cannot stop the trading engine.
+* * Gemini cannot execute Deriv trades.
+* * Gemini failures produce HOLD for the current cycle.
 *
-* Market Data
-* 
-   ↓
-
-* Gemini Analysis
-* 
-   ↓
-
-* Strategy Validation
-* 
-   ↓
-
-* Risk Management
-* 
-   ↓
-
-* Backend-controlled Deriv Execution
-*
-* Gemini NEVER receives the Deriv token and NEVER calls Deriv.
+* Emergency Stop is controlled exclusively by the application's
+* explicit backend settings/controller logic.
   */
   export class GeminiTradingService {
   constructor() {
   if (!env.GEMINI_API_KEY) {
   throw new Error(
-  "GEMINI_API_KEY is not configured",
+  "GEMINI_API_KEY is not configured"
   );
   }
 
   if (!env.GEMINI_MODEL) {
   throw new Error(
-  "GEMINI_MODEL is not configured",
+  "GEMINI_MODEL is not configured"
   );
   }
 
   this.client = new GoogleGenerativeAI(
-  env.GEMINI_API_KEY,
+  env.GEMINI_API_KEY
   );
 
   this.model =
   this.client.getGenerativeModel({
   model: env.GEMINI_MODEL,
 
-
+  
    generationConfig: {
      responseMimeType:
        "application/json",
@@ -281,17 +269,18 @@ GEMINI TRADING ANALYSIS SERVICE
 
      maxOutputTokens: 1_200,
    },
-
+  
 
   });
   }
 
 /**
 
-* Generate an AI trading analysis.
+* Generate an AI market analysis.
 *
-* The returned BUY/SELL/HOLD is a signal used by the backend.
-* It is never directly sent to the Deriv API.
+* BUY/SELL/HOLD is only an analysis signal. The backend independently
+* performs strategy validation, risk management, account validation,
+* and execution authorization.
   */
   async analyze(context) {
   let validatedContext;
@@ -307,13 +296,13 @@ try {
   throw new AppError(
     "Invalid market analysis context",
     400,
-    "INVALID_ANALYSIS_CONTEXT",
+    "INVALID_ANALYSIS_CONTEXT"
   );
 }
 
 const expectedMarket =
   normalizeMarket(
-    validatedContext.symbol,
+    validatedContext.symbol
   );
 
 const safeContext = sanitizeValue({
@@ -359,14 +348,15 @@ Return exactly one JSON object:
 
 RULES:
 
-1. BUY and SELL are trading ANALYSIS signals.
+1. BUY and SELL are trading ANALYSIS signals only.
 2. The backend independently validates every signal.
 3. If data is insufficient, conflicting, stale, or ambiguous, return HOLD.
 4. Never invent prices, indicators, trends, news, or historical data.
 5. Never guarantee profit or a successful trade.
 6. Confidence is confidence in the analytical signal, not probability of profit.
-7. recommendedParameters are informational only and are not executable.
-8. Return only valid JSON without Markdown.
+7. recommendedParameters are informational only and are never executable.
+8. You cannot authorize, execute, stop, or emergency-stop trading.
+9. Return only valid JSON without Markdown.
 
 MARKET DATA:
 
@@ -380,7 +370,7 @@ try {
   result = await withTimeout(
     this.model.generateContent(prompt),
     AI_TIMEOUT_MS,
-    "Gemini market analysis timed out",
+    "Gemini market analysis timed out"
   );
 } catch (error) {
   if (error instanceof AppError) {
@@ -391,7 +381,7 @@ try {
     error?.message ||
       "Gemini market analysis failed",
     502,
-    "GEMINI_ANALYSIS_FAILED",
+    "GEMINI_ANALYSIS_FAILED"
   );
 }
 
@@ -403,7 +393,7 @@ try {
   throw new AppError(
     "Unable to read Gemini analysis response",
     502,
-    "GEMINI_RESPONSE_READ_FAILED",
+    "GEMINI_RESPONSE_READ_FAILED"
   );
 }
 
@@ -418,7 +408,7 @@ try {
   throw new AppError(
     "Gemini returned an invalid analysis structure",
     502,
-    "GEMINI_INVALID_ANALYSIS",
+    "GEMINI_INVALID_ANALYSIS"
   );
 }
 
@@ -429,7 +419,7 @@ if (returnedMarket !== expectedMarket) {
   throw new AppError(
     "Gemini returned analysis for an unexpected market",
     502,
-    "GEMINI_MARKET_MISMATCH",
+    "GEMINI_MARKET_MISMATCH"
   );
 }
 
@@ -446,18 +436,20 @@ return {
 
 /**
 
-* Safe method for the automatic trading engine.
+* Safe method for AutoTradingService.
 *
-* Timeout, network errors, invalid JSON, or Gemini failures
-* always result in HOLD.
+* Gemini errors do NOT stop the engine and do NOT activate Emergency Stop.
+* They only reject the current cycle by returning HOLD.
+*
+* The next scheduled cycle can analyze the market again normally.
   */
   async analyzeSafely(context) {
   try {
   return await this.analyze(context);
   } catch (error) {
   console.error(
-  "Gemini analysis failed:",
-  error?.message || error,
+  "Gemini analysis failed for current cycle:",
+  error?.message || error
   );
 
   return {
@@ -465,11 +457,11 @@ return {
   confidence: 0,
 
   market: normalizeMarket(
-  context?.symbol || "UNKNOWN",
+  context?.symbol || "UNKNOWN"
   ),
 
   reason:
-  "AI analysis is unavailable, timed out, or returned invalid data. No trade signal was accepted.",
+  "AI analysis was unavailable for this cycle. Trading was skipped and the engine will continue with the next scheduled cycle.",
 
   recommendedParameters: {},
 
@@ -481,6 +473,12 @@ return {
   errorCode:
   error?.code ||
   "GEMINI_ANALYSIS_FAILED",
+
+  /**
+  * Explicitly documents that this result must not be interpreted
+  * as an Emergency Stop request.
+  */
+  emergencyStopRequested: false,
   };
   }
   }

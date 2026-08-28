@@ -4,29 +4,42 @@ import { Trade } from "../models/Trade.js";
 /**
  * TradeMonitoringService
  *
- * Responsible for monitoring contracts after execution and synchronizing
- * their lifecycle with the application's Trade records.
+ * Responsible for monitoring Deriv contracts after execution and
+ * synchronizing their lifecycle with the application's Trade records.
  *
- * This service does NOT authorize or execute trades.
+ * IMPORTANT:
+ * This service does NOT:
+ * - authorize trades
+ * - execute trades
+ * - start or stop the trading engine
+ * - activate Emergency Stop
+ *
+ * A monitoring failure is NOT automatically an emergency. Callers may
+ * log the failure and retry according to their own retry policy.
  */
 export class TradeMonitoringService {
   /**
-   * Get the latest state of a contract.
+   * Get the latest state of a contract from Deriv.
    *
-   * `subscribe` is disabled by default because a one-time status check
-   * should not create an unmanaged long-lived subscription.
+   * `subscribe` is disabled because this is a one-time status request.
+   * Long-lived subscriptions must be managed explicitly elsewhere.
    */
-  async getContract(
-    accountId,
-    token,
-    contractId
-  ) {
+  async getContract(accountId, token, contractId) {
     if (!accountId) {
       throw new Error("accountId is required");
     }
 
-    if (!contractId) {
-      throw new Error("contractId is required");
+    if (!token) {
+      throw new Error("Deriv token is required");
+    }
+
+    const normalizedContractId = Number(contractId);
+
+    if (
+      !Number.isFinite(normalizedContractId) ||
+      normalizedContractId <= 0
+    ) {
+      throw new Error("A valid contractId is required");
     }
 
     const msg = await derivConnectionManager.request(
@@ -34,7 +47,7 @@ export class TradeMonitoringService {
       token,
       {
         proposal_open_contract: 1,
-        contract_id: Number(contractId),
+        contract_id: normalizedContractId,
         subscribe: 0,
       }
     );
@@ -51,13 +64,10 @@ export class TradeMonitoringService {
   /**
    * Backward-compatible monitor method.
    *
-   * A single request is safer than silently creating a subscription.
+   * A monitoring request is a normal status check and never changes
+   * trading settings or Emergency Stop state.
    */
-  async monitor(
-    accountId,
-    token,
-    contractId
-  ) {
+  async monitor(accountId, token, contractId) {
     return this.getContract(
       accountId,
       token,
@@ -68,16 +78,21 @@ export class TradeMonitoringService {
   /**
    * Apply the latest Deriv contract state to the local Trade record.
    *
-   * This method is idempotent: applying the same contract update more
-   * than once should not create additional trades or corrupt history.
+   * This method is idempotent and never creates additional Trade records.
+   * Applying the same update multiple times is safe.
+   *
+   * A synchronization failure must NOT activate Emergency Stop.
    */
   async apply(contract) {
     if (
       !contract ||
+      typeof contract !== "object" ||
       !contract.contract_id
     ) {
       return {
         updated: false,
+        closed: false,
+        emergencyStopRequested: false,
         reason: "INVALID_CONTRACT",
       };
     }
@@ -93,18 +108,22 @@ export class TradeMonitoringService {
     if (!trade) {
       return {
         updated: false,
+        closed: false,
+        emergencyStopRequested: false,
         reason: "TRADE_NOT_FOUND",
         derivContractId,
       };
     }
 
     /**
-     * Never reopen a locally closed trade because of an old
-     * out-of-order WebSocket message.
+     * Never reopen a locally closed trade because an old or out-of-order
+     * Deriv response arrived after the final contract update.
      */
     if (trade.status === "closed") {
       return {
         updated: false,
+        closed: true,
+        emergencyStopRequested: false,
         reason: "TRADE_ALREADY_CLOSED",
         derivContractId,
       };
@@ -113,13 +132,23 @@ export class TradeMonitoringService {
     const update = {};
 
     /**
-     * Deriv may provide the current contract status in different fields
-     * depending on the contract response. Preserve only meaningful values.
+     * Preserve Deriv's contract status when available.
      */
-    if (contract.status) {
-      update.derivStatus = String(contract.status);
+    if (
+      contract.status !== undefined &&
+      contract.status !== null &&
+      String(contract.status).trim()
+    ) {
+      update.derivStatus = String(
+        contract.status
+      ).trim();
     }
 
+    /**
+     * Update the current spot without requiring it to be positive.
+     * Some financial instruments can theoretically have values where
+     * positivity should not be assumed by this monitoring layer.
+     */
     if (
       contract.current_spot !== undefined &&
       contract.current_spot !== null
@@ -134,7 +163,8 @@ export class TradeMonitoringService {
     }
 
     /**
-     * Contract is finished/sold.
+     * Deriv considers the contract finished when it has been sold or
+     * expired. Normalize both boolean and numeric representations.
      */
     const isClosed =
       contract.is_sold === 1 ||
@@ -145,6 +175,9 @@ export class TradeMonitoringService {
     if (isClosed) {
       update.status = "closed";
 
+      /**
+       * Profit can be negative, zero, or positive.
+       */
       const profit = Number(contract.profit);
 
       if (Number.isFinite(profit)) {
@@ -152,27 +185,7 @@ export class TradeMonitoringService {
       }
 
       /**
-       * Use Deriv's sell time when available; otherwise use the time
-       * the backend confirmed the closed state.
-       */
-      const exitEpoch =
-        contract.sell_time ||
-        contract.date_expiry;
-
-      if (
-        exitEpoch !== undefined &&
-        Number.isFinite(Number(exitEpoch)) &&
-        Number(exitEpoch) > 0
-      ) {
-        update.closedAt = new Date(
-          Number(exitEpoch) * 1000
-        );
-      } else {
-        update.closedAt = new Date();
-      }
-
-      /**
-       * Store the final payout when available.
+       * Store the final payout when supplied by Deriv.
        */
       if (
         contract.payout !== undefined &&
@@ -184,11 +197,30 @@ export class TradeMonitoringService {
           update.payout = payout;
         }
       }
-    } else if (
-      trade.status === "pending"
-    ) {
+
       /**
-       * A contract exists and is being monitored.
+       * Prefer Deriv's final sell time, then expiry time. Fall back to
+       * the backend confirmation time only when Deriv provides neither.
+       */
+      const exitEpoch =
+        contract.sell_time ??
+        contract.date_expiry;
+
+      if (
+        exitEpoch !== undefined &&
+        exitEpoch !== null &&
+        Number.isFinite(Number(exitEpoch)) &&
+        Number(exitEpoch) > 0
+      ) {
+        update.closedAt = new Date(
+          Number(exitEpoch) * 1000
+        );
+      } else {
+        update.closedAt = new Date();
+      }
+    } else if (trade.status === "pending") {
+      /**
+       * The contract is confirmed by Deriv and remains open.
        */
       update.status = "open";
     }
@@ -196,12 +228,18 @@ export class TradeMonitoringService {
     if (Object.keys(update).length === 0) {
       return {
         updated: false,
+        closed: false,
+        emergencyStopRequested: false,
         reason: "NO_CHANGES",
         derivContractId,
       };
     }
 
-    await Trade.updateOne(
+    /**
+     * The status condition prevents a race where another process closes
+     * the trade between findOne() and updateOne().
+     */
+    const writeResult = await Trade.updateOne(
       {
         _id: trade._id,
         status: { $ne: "closed" },
@@ -211,9 +249,21 @@ export class TradeMonitoringService {
       }
     );
 
+    if (writeResult.matchedCount === 0) {
+      return {
+        updated: false,
+        closed: isClosed,
+        emergencyStopRequested: false,
+        reason: "TRADE_CLOSED_DURING_UPDATE",
+        derivContractId,
+      };
+    }
+
     return {
-      updated: true,
+      updated:
+        writeResult.modifiedCount > 0,
       closed: isClosed,
+      emergencyStopRequested: false,
       derivContractId,
       update,
     };
@@ -221,12 +271,12 @@ export class TradeMonitoringService {
 
   /**
    * Fetch the latest contract state and synchronize it locally.
+   *
+   * Errors are deliberately propagated to the caller so they can be
+   * logged and retried. This service does not convert a temporary Deriv
+   * connection problem into an Emergency Stop.
    */
-  async refresh(
-    accountId,
-    token,
-    contractId
-  ) {
+  async refresh(accountId, token, contractId) {
     const contract = await this.getContract(
       accountId,
       token,
@@ -238,6 +288,11 @@ export class TradeMonitoringService {
     return {
       contract,
       ...result,
+
+      /**
+       * Monitoring never requests an emergency state.
+       */
+      emergencyStopRequested: false,
     };
   }
 }

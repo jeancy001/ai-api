@@ -75,7 +75,7 @@ if (!userId) {
 throw new AppError(
 "Authentication required",
 401,
-"UNAUTHORIZED",
+"UNAUTHORIZED"
 );
 }
 
@@ -86,7 +86,8 @@ return String(userId);
 
 * Default settings for a new user.
 *
-* Safety-sensitive execution fields always start disabled.
+* Emergency Stop is disabled by default. A value of false must never
+* stop the trading engine or prevent normal trading authorization.
   */
   function createDefaultSettings(userId) {
   return {
@@ -94,10 +95,16 @@ return String(userId);
 
   selectedMarket: null,
 
-  // Backend-controlled safety state.
+  // Backend-controlled execution and safety state.
   autoTradingEnabled: false,
   realTradingAuthorized: false,
-  emergencyStop: false,
+
+  /**
+
+  * false = Emergency Stop is NOT active.
+  * true  = Emergency Stop is explicitly active.
+    */
+    emergencyStop: false,
 
   // Risk configuration.
   stake: 1,
@@ -143,7 +150,7 @@ return typeof settings.toObject === "function"
 function hasOwn(object, key) {
 return Object.prototype.hasOwnProperty.call(
 object,
-key,
+key
 );
 }
 
@@ -158,7 +165,7 @@ if (!Number.isFinite(value)) {
 throw new AppError(
 `${field} must be a valid number`,
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -195,7 +202,7 @@ patch.stake <= 0
 throw new AppError(
 "Stake must be greater than zero",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -206,7 +213,7 @@ patch.maxStake <= 0
 throw new AppError(
 "Maximum stake must be greater than zero",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -217,7 +224,7 @@ patch.minimumBalance < 0
 throw new AppError(
 "Minimum balance cannot be negative",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -228,45 +235,51 @@ patch.maxDailyLoss < 0
 throw new AppError(
 "Maximum daily loss cannot be negative",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
 if (
 hasOwn(patch, "maxDailyTrades") &&
-(!Number.isInteger(patch.maxDailyTrades) ||
-patch.maxDailyTrades < 1)
+(
+!Number.isInteger(patch.maxDailyTrades) ||
+patch.maxDailyTrades < 1
+)
 ) {
 throw new AppError(
 "Maximum daily trades must be a positive integer",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
 if (
 hasOwn(patch, "maxConsecutiveLosses") &&
-(!Number.isInteger(
-patch.maxConsecutiveLosses,
+(
+!Number.isInteger(
+patch.maxConsecutiveLosses
 ) ||
-patch.maxConsecutiveLosses < 1)
+patch.maxConsecutiveLosses < 1
+)
 ) {
 throw new AppError(
 "Maximum consecutive losses must be a positive integer",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
 if (
 hasOwn(patch, "aiConfidenceThreshold") &&
-(patch.aiConfidenceThreshold < 0 ||
-patch.aiConfidenceThreshold > 1)
+(
+patch.aiConfidenceThreshold < 0 ||
+patch.aiConfidenceThreshold > 1
+)
 ) {
 throw new AppError(
 "AI confidence threshold must be between 0 and 1",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -276,43 +289,47 @@ for (const field of [
 ]) {
 if (
 hasOwn(patch, field) &&
-(!Number.isInteger(patch[field]) ||
+(
+!Number.isInteger(patch[field]) ||
 patch[field] < MIN_ANALYSIS_INTERVAL ||
-patch[field] > MAX_ANALYSIS_INTERVAL)
+patch[field] > MAX_ANALYSIS_INTERVAL
+)
 ) {
 throw new AppError(
 `${field} must be an integer between ${MIN_ANALYSIS_INTERVAL} and ${MAX_ANALYSIS_INTERVAL} milliseconds`,
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 }
 
 if (
 hasOwn(patch, "cooldown") &&
-(!Number.isInteger(patch.cooldown) ||
+(
+!Number.isInteger(patch.cooldown) ||
 patch.cooldown < MIN_COOLDOWN ||
-patch.cooldown > MAX_COOLDOWN)
+patch.cooldown > MAX_COOLDOWN
+)
 ) {
 throw new AppError(
 `Cooldown must be an integer between ${MIN_COOLDOWN} and ${MAX_COOLDOWN} milliseconds`,
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
 if (
 hasOwn(patch, "contractDuration") &&
-(!Number.isInteger(patch.contractDuration) ||
-patch.contractDuration <
-MIN_CONTRACT_DURATION ||
-patch.contractDuration >
-MAX_CONTRACT_DURATION)
+(
+!Number.isInteger(patch.contractDuration) ||
+patch.contractDuration < MIN_CONTRACT_DURATION ||
+patch.contractDuration > MAX_CONTRACT_DURATION
+)
 ) {
 throw new AppError(
 `Contract duration must be an integer between ${MIN_CONTRACT_DURATION} and ${MAX_CONTRACT_DURATION}`,
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -328,7 +345,7 @@ typeof patch.selectedMarket !== "string"
 throw new AppError(
 "Selected market must be a valid market symbol",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -336,11 +353,11 @@ if (typeof patch.selectedMarket === "string") {
 patch.selectedMarket =
 patch.selectedMarket.trim().toUpperCase();
 
-```
+
 if (!patch.selectedMarket) {
   patch.selectedMarket = null;
 }
-```
+
 
 }
 
@@ -356,17 +373,17 @@ typeof patch.contractType !== "string"
 throw new AppError(
 "Contract type must be a valid string",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
-```
+
 if (typeof patch.contractType === "string") {
   patch.contractType =
     patch.contractType.trim().toUpperCase() ||
     null;
 }
-```
+
 
 }
 
@@ -378,11 +395,11 @@ typeof patch.contractDurationUnit !== "string"
 throw new AppError(
 "Contract duration unit must be a valid string",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
-```
+
 if (
   typeof patch.contractDurationUnit ===
   "string"
@@ -395,17 +412,17 @@ if (
   if (
     patch.contractDurationUnit &&
     !ALLOWED_DURATION_UNITS.has(
-      patch.contractDurationUnit,
+      patch.contractDurationUnit
     )
   ) {
     throw new AppError(
       "Unsupported contract duration unit",
       400,
-      "VALIDATION_ERROR",
+      "VALIDATION_ERROR"
     );
   }
 }
-```
+
 
 }
 
@@ -414,26 +431,26 @@ if (typeof patch.stakeBasis !== "string") {
 throw new AppError(
 "Stake basis must be a valid string",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
-```
+
 patch.stakeBasis =
   patch.stakeBasis.trim().toLowerCase();
 
 if (
   !ALLOWED_STAKE_BASES.has(
-    patch.stakeBasis,
+    patch.stakeBasis
   )
 ) {
   throw new AppError(
     "Stake basis must be either stake or payout",
     400,
-    "VALIDATION_ERROR",
+    "VALIDATION_ERROR"
   );
 }
-```
+
 
 }
 
@@ -445,11 +462,11 @@ typeof patch.currency !== "string"
 throw new AppError(
 "Currency must be a valid string",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
-```
+
 if (typeof patch.currency === "string") {
   patch.currency =
     patch.currency.trim().toUpperCase() ||
@@ -457,16 +474,18 @@ if (typeof patch.currency === "string") {
 
   if (
     patch.currency &&
-    !/^[A-Z]{3,10}$/.test(patch.currency)
+    !/^[A-Z]{3,10}$/.test(
+      patch.currency
+    )
   ) {
     throw new AppError(
       "Currency format is invalid",
       400,
-      "VALIDATION_ERROR",
+      "VALIDATION_ERROR"
     );
   }
 }
-```
+
 
 }
 }
@@ -481,12 +500,12 @@ if (typeof patch.currency === "string") {
   function synchronizeIntervals(patch) {
   const hasAnalysisInterval = hasOwn(
   patch,
-  "analysisInterval",
+  "analysisInterval"
   );
 
 const hasTradingInterval = hasOwn(
 patch,
-"tradingIntervalMs",
+"tradingIntervalMs"
 );
 
 if (
@@ -498,7 +517,7 @@ patch.tradingIntervalMs
 throw new AppError(
 "analysisInterval and tradingIntervalMs must match when both are provided",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -532,7 +551,7 @@ if (!market) {
 throw new AppError(
 `The market "${selectedMarket}" is not available on Deriv`,
 400,
-"MARKET_UNAVAILABLE",
+"MARKET_UNAVAILABLE"
 );
 }
 
@@ -543,7 +562,7 @@ market.exchange_is_open === false
 throw new AppError(
 `The market "${selectedMarket}" is currently closed`,
 400,
-"MARKET_CLOSED",
+"MARKET_CLOSED"
 );
 }
 }
@@ -554,7 +573,7 @@ await TradingSettings.findOne({ userId });
 
 if (!settings) {
 settings = await TradingSettings.create(
-createDefaultSettings(userId),
+createDefaultSettings(userId)
 );
 }
 
@@ -591,9 +610,14 @@ PUT /api/v1/settings/trading
 * * emergencyStop
 * * stopReason
 * * authorization timestamps
-    */
-    export async function update(req, res) {
-    const userId = getUserId(req);
+*
+* IMPORTANT:
+* emergencyStop is NOT modified here. When emergencyStop is false,
+* this endpoint does not stop trading. When it is true, the dedicated
+* emergency-stop flow is responsible for handling the emergency state.
+  */
+  export async function update(req, res) {
+  const userId = getUserId(req);
 
 if (
 !req.body ||
@@ -603,7 +627,7 @@ Array.isArray(req.body)
 throw new AppError(
 "Invalid settings data",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -612,14 +636,14 @@ Object.keys(req.body);
 
 const forbiddenFields =
 submittedFields.filter(
-(field) => !ALLOWED_FIELDS.has(field),
+(field) => !ALLOWED_FIELDS.has(field)
 );
 
 if (forbiddenFields.length > 0) {
 throw new AppError(
 `The following settings cannot be modified: ${forbiddenFields.join(", ")}`,
 403,
-"SETTINGS_FIELD_NOT_ALLOWED",
+"SETTINGS_FIELD_NOT_ALLOWED"
 );
 }
 
@@ -629,7 +653,7 @@ if (Object.keys(patch).length === 0) {
 throw new AppError(
 "No settings were provided",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -653,7 +677,7 @@ if (effectiveStake > effectiveMaxStake) {
 throw new AppError(
 "Stake cannot be greater than maximum stake",
 400,
-"VALIDATION_ERROR",
+"VALIDATION_ERROR"
 );
 }
 
@@ -663,28 +687,35 @@ MARKET VALIDATION
 
 if (hasOwn(patch, "selectedMarket")) {
 await validateSelectedMarket(
-patch.selectedMarket,
+patch.selectedMarket
 );
 }
 
 /* ----------------------------------------------------------
-SAFETY: NEVER CHANGE ACTIVE CONFIGURATION MID-TRADE
+ACTIVE TRADING CONFIGURATION
 ---------------------------------------------------------- */
 
 if (current.autoTradingEnabled) {
 throw new AppError(
 "Stop auto-trading before changing trading or risk settings",
 409,
-"STOP_TRADING_BEFORE_SETTINGS_CHANGE",
+"STOP_TRADING_BEFORE_SETTINGS_CHANGE"
 );
 }
 
 /**
 
-* Emergency Stop intentionally remains active until a dedicated
-* backend-controlled reset endpoint clears it.
+* IMPORTANT EMERGENCY STOP BEHAVIOR:
 *
-* This settings endpoint must never silently clear it.
+* * emergencyStop === false:
+* Emergency Stop is inactive. Nothing is stopped here.
+*
+* * emergencyStop === true:
+* The emergency state remains active and can only be changed by
+* a dedicated backend-controlled emergency endpoint.
+*
+* This normal settings endpoint NEVER changes emergencyStop and
+* NEVER stops an engine simply because the field exists.
   */
 
 Object.assign(current, patch);
@@ -704,9 +735,19 @@ current.selectedMarket || null,
 contractConfigured: Boolean(
 current.contractType &&
 current.contractDuration &&
-current.contractDurationUnit,
+current.contractDurationUnit
 ),
+
+
+  /**
+   * Informational only. This endpoint does not change or trigger
+   * the emergency state.
+   */
+  emergencyStopActive:
+    current.emergencyStop === true,
 },
+
+
 });
 
 return res.status(200).json({

@@ -15,28 +15,50 @@ import { decrypt } from "../utils/crypto.js";
 const MIN_INTERVAL = 5_000;
 const DEFAULT_INTERVAL = 15_000;
 
-export class AutoTradingService {
-constructor() {
 /**
-* Prevents overlapping executions for the same user.
-*/
-this.locks = new Set();
 
+* AutoTradingService
+*
+* IMPORTANT EMERGENCY-STOP POLICY:
+*
+* This service NEVER sets `TradingSettings.emergencyStop` to true.
+*
+* Ordinary conditions such as:
+* * AI HOLD or low confidence
+* * strategy rejection
+* * risk rejection
+* * stale/unavailable market data
+* * temporary Deriv/API errors
+* * proposal rejection
+* * a failed cycle
+*
+* must NOT automatically activate Emergency Stop.
+*
+* Emergency Stop is an explicit persistent safety state managed by
+* a dedicated controller/service. When an emergency state already
+* exists, this service respects it and stops its local scheduler.
+  */
+  export class AutoTradingService {
+  constructor() {
+  /**
 
-/**
- * Active trading engines.
- *
- * Map<userId, {
- *   timer: NodeJS.Timeout | null,
- *   running: boolean,
- *   stopped: boolean,
- *   interval: number,
- * }>
- */
-this.engines = new Map();
+  * Prevent overlapping executions for the same user.
+    */
+    this.locks = new Set();
 
+  /**
 
-}
+  * Active trading engines.
+  *
+  * Map<userId, {
+  * timer: NodeJS.Timeout | null,
+  * running: boolean,
+  * stopped: boolean,
+  * interval: number,
+  * }>
+    */
+    this.engines = new Map();
+    }
 
 /* ============================================================
 ENGINE LIFECYCLE
@@ -44,11 +66,12 @@ ENGINE LIFECYCLE
 
 /**
 
-* Start the user's trading engine.
+* Start the user's local trading engine.
 *
-* This starts only the scheduler. Every cycle independently
-* validates the account, authorization, emergency-stop state,
-* market availability, and risk rules.
+* This method starts only the scheduler. Every cycle independently
+* validates the current database state before a trade can proceed.
+*
+* This method NEVER clears or activates Emergency Stop.
   */
   async start(userId) {
   const id = String(userId);
@@ -86,7 +109,10 @@ if (!settings.realTradingAuthorized) {
   );
 }
 
-if (settings.emergencyStop) {
+/**
+ * Respect an existing emergency state, but never modify it here.
+ */
+if (settings.emergencyStop === true) {
   throw new Error(
     "Emergency Stop is active. Reset it before starting trading."
   );
@@ -98,10 +124,6 @@ if (!settings.selectedMarket?.trim()) {
   );
 }
 
-/**
- * Support both the newer tradingIntervalMs field and the
- * existing analysisInterval field.
- */
 const configuredInterval = Number(
   settings.tradingIntervalMs ??
     settings.analysisInterval
@@ -121,10 +143,6 @@ const engine = {
 this.engines.set(id, engine);
 
 const executeCycle = async () => {
-  /**
-   * The engine may have been stopped while this callback was
-   * waiting in the event loop.
-   */
   if (engine.stopped || engine.running) {
     return;
   }
@@ -132,6 +150,12 @@ const executeCycle = async () => {
   engine.running = true;
 
   try {
+    /**
+     * A failed cycle is logged and skipped.
+     *
+     * DO NOT activate Emergency Stop automatically here.
+     * The next scheduled cycle may continue normally.
+     */
     await this.runUserCycle(id);
   } catch (error) {
     console.error(
@@ -144,8 +168,7 @@ const executeCycle = async () => {
 };
 
 /**
- * Run the first cycle immediately so the user does not have to
- * wait for the first interval.
+ * Run the first cycle immediately.
  */
 void executeCycle();
 
@@ -165,8 +188,9 @@ return {
 
 * Stop the user's local trading engine immediately.
 *
-* Controllers should persist the appropriate database state
-* before or alongside calling this method.
+* IMPORTANT:
+* This only stops the in-memory scheduler. It does NOT activate
+* Emergency Stop and does NOT modify persistent settings.
   */
   async stop(userId, reason = "STOPPED") {
   const id = String(userId);
@@ -183,10 +207,6 @@ if (!engine) {
   };
 }
 
-/**
- * Mark stopped before clearing the timer. This prevents an
- * already queued callback from beginning a new cycle.
- */
 engine.stopped = true;
 
 if (engine.timer) {
@@ -206,11 +226,11 @@ return {
 
 /**
 
-* Immediately stop the local engine after Emergency Stop.
+* Backward-compatible method used when another trusted part of the
+* backend has ALREADY activated Emergency Stop.
 *
-* The controller is responsible for setting emergencyStop=true
-* in the database. This method ensures the in-memory scheduler
-* is also terminated immediately.
+* This method only stops the local scheduler.
+* It NEVER writes emergencyStop=true to the database.
   */
   async emergencyStop(
   userId,
@@ -245,13 +265,10 @@ USER CYCLE
   const id = String(userId);
 
 
-/**
-
-
-
- * Recheck engine state before doing account or token work.
- */
 if (!this.isRunning(id)) {
+
+
+
   return {
     skipped: true,
     reason: "ENGINE_NOT_RUNNING",
@@ -327,6 +344,9 @@ PROTECTED TRADING CYCLE
 /**
 
 * Execute one protected trading cycle.
+*
+* Rejections and ordinary failures skip the current cycle.
+* They do NOT activate Emergency Stop.
   */
   async runOnce({ userId, accessToken }) {
   const id = String(userId);
@@ -345,10 +365,6 @@ if (this.locks.has(id)) {
 this.locks.add(id);
 
 try {
-  /**
-   * An engine may have been stopped immediately after the cycle
-   * was scheduled.
-   */
   if (!this.isRunning(id)) {
     return {
       skipped: true,
@@ -393,11 +409,14 @@ try {
     };
   }
 
-  if (settings.emergencyStop) {
-    /**
-     * Stop the local scheduler too. Future cycles should not
-     * continue running while the emergency state is active.
-     */
+  /**
+   * Respect a persistent emergency state if one was explicitly
+   * activated elsewhere.
+   *
+   * We stop only the local scheduler. This service does not create,
+   * reset, or modify the emergency state.
+   */
+  if (settings.emergencyStop === true) {
     await this.stop(id, "EMERGENCY_STOP_ACTIVE");
 
     return {
@@ -434,9 +453,6 @@ try {
     };
   }
 
-  /**
-   * Verify the market against the real Deriv market catalogue.
-   */
   const symbol =
     await derivMarketService.symbol(selectedMarket);
 
@@ -447,10 +463,6 @@ try {
     };
   }
 
-  /**
-   * Do not continue if the engine was stopped while awaiting
-   * the market validation request.
-   */
   if (!this.isRunning(id)) {
     return {
       skipped: true,
@@ -471,10 +483,6 @@ try {
     ),
   ]);
 
-  /**
-   * Never use `!balance.balance`: a numeric zero is valid data,
-   * even though it will normally fail the later risk checks.
-   */
   const numericBalance = Number(balance?.balance);
 
   if (!Number.isFinite(numericBalance)) {
@@ -486,7 +494,10 @@ try {
 
   const currentPrice = Number(market?.quote);
 
-  if (!Number.isFinite(currentPrice)) {
+  if (
+    !Number.isFinite(currentPrice) ||
+    currentPrice <= 0
+  ) {
     return {
       skipped: true,
       reason: "MARKET_DATA_UNAVAILABLE",
@@ -501,15 +512,9 @@ try {
   }
 
   /* --------------------------------------------------------
-     AI ANALYSIS
+     AI ANALYSIS — ANALYSIS ONLY
   -------------------------------------------------------- */
 
-  /**
-   * AI is analysis only.
-   *
-   * Gemini never receives direct authority to place trades.
-   * Contract parameters and execution remain backend-controlled.
-   */
   const analysis =
     await geminiTradingService.analyze({
       symbol: selectedMarket,
@@ -540,7 +545,11 @@ try {
   const strategy =
     tradingStrategyService.validate(
       analysis,
-      market
+      market,
+      {
+        minimumConfidence: confidenceThreshold,
+        expectedSymbol: selectedMarket,
+      }
     );
 
   if (!strategy?.approved) {
@@ -550,6 +559,7 @@ try {
         strategy?.reasons?.[0] ||
         "STRATEGY_REJECTED",
       analysis,
+      strategy,
     };
   }
 
@@ -588,10 +598,6 @@ try {
     };
   }
 
-  /**
-   * The engine could have been stopped during AI analysis,
-   * strategy validation, or risk evaluation.
-   */
   if (!this.isRunning(id)) {
     return {
       skipped: true,
@@ -650,7 +656,7 @@ try {
   }
 
   /* --------------------------------------------------------
-     FINAL SAFETY CHECK — IMMEDIATELY BEFORE PURCHASE
+     FINAL SAFETY CHECK — BEFORE PURCHASE
   -------------------------------------------------------- */
 
   const [finalSettings, finalAccount] =
@@ -668,12 +674,24 @@ try {
 
   if (
     !finalSettings?.autoTradingEnabled ||
-    !finalSettings?.realTradingAuthorized ||
-    finalSettings?.emergencyStop
+    !finalSettings?.realTradingAuthorized
   ) {
     return {
       skipped: true,
       reason: "TRADING_STATE_CHANGED_BEFORE_EXECUTION",
+    };
+  }
+
+  /**
+   * An Emergency Stop activated by the user elsewhere is always
+   * respected, but this cycle does not create that emergency state.
+   */
+  if (finalSettings.emergencyStop === true) {
+    await this.stop(id, "EMERGENCY_STOP_ACTIVE");
+
+    return {
+      skipped: true,
+      reason: "EMERGENCY_STOP_ACTIVE",
     };
   }
 
@@ -717,10 +735,9 @@ try {
 
   if (!derivContractId) {
     /**
-     * A successful purchase response without an identifiable
-     * contract should be treated as an execution inconsistency.
-     *
-     * Do not fabricate a contract ID.
+     * This is an execution inconsistency and should be logged by
+     * the caller. It still does NOT automatically activate
+     * Emergency Stop.
      */
     throw new Error(
       "Deriv purchase completed without a contract identifier"
@@ -774,8 +791,8 @@ CONTRACT CONFIGURATION
 * Build contract parameters exclusively from explicitly configured
 * and backend-approved settings.
 *
-* AI analysis can influence the strategy decision, but it must not
-* be allowed to invent arbitrary Deriv API parameters.
+* AI analysis never receives authority to invent arbitrary Deriv
+* API parameters.
   */
   buildContractParameters({
   settings,
@@ -821,12 +838,6 @@ if (
   return null;
 }
 
-/**
- * Basic defensive validation.
- *
- * Your backend should maintain an allowlist that matches the
- * contract types and duration units your application supports.
- */
 const allowedDurationUnits = new Set([
   "s",
   "m",
@@ -859,9 +870,6 @@ const parameters = {
   symbol: symbol.symbol,
 };
 
-/**
- * Remove undefined values before sending the request.
- */
 return Object.fromEntries(
   Object.entries(parameters).filter(
     ([, value]) => value !== undefined
@@ -879,9 +887,7 @@ APPLICATION SHUTDOWN
 
 * Stop every local engine.
 *
-* Useful during graceful application shutdown. This only stops
-* local timers; persistent trading state should be managed by
-* your shutdown policy/controllers.
+* This only stops local timers and NEVER activates Emergency Stop.
   */
   async stopAll(reason = "APPLICATION_SHUTDOWN") {
   const userIds = [...this.engines.keys()];
