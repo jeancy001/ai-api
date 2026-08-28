@@ -690,47 +690,61 @@ Releasing Emergency Stop removes only the emergency block.
 It NEVER automatically starts trading.
 ============================================================ */
 
+/* ============================================================
+POST /trading/release-emergency-stop
+
+Releases only the Emergency Stop lock.
+
+IMPORTANT:
+- Does NOT authorize real-money trading.
+- Does NOT start the trading engine.
+- Does NOT enable auto-trading.
+- The user must explicitly press Start afterwards.
+============================================================ */
+
 export async function releaseEmergencyStop(req, res) {
-const userId = getUserId(req);
+  const userId = getUserId(req);
 
-const settings = await getSettings(userId);
+  const settings = await getSettings(userId);
 
-if (settings.emergencyStop !== true) {
-return res.status(200).json({
-success: true,
-message: "Emergency Stop is not active",
-data: serializeSettings(settings),
-});
-}
+  // Idempotent: releasing an inactive emergency stop is safe.
+  if (settings.emergencyStop !== true) {
+    return res.status(200).json({
+      success: true,
+      message: "Emergency Stop is already inactive.",
+      data: serializeSettings(settings),
+    });
+  }
 
-/**
+  /**
+   * Keep trading explicitly stopped.
+   *
+   * Releasing the emergency lock must NEVER restart the engine.
+   */
+  settings.autoTradingEnabled = false;
+  settings.emergencyStop = false;
+  settings.stopReason = "EMERGENCY_STOP_RELEASED";
+  settings.emergencyReleasedAt = new Date();
 
-* Verify the account before allowing the emergency state to be
-* released. This still does NOT start the scheduler.
-  */
-  await getSelectedRealAccountOrThrow(userId);
+  await settings.save();
 
-settings.autoTradingEnabled = false;
-settings.emergencyStop = false;
-settings.stopReason = "EMERGENCY_STOP_RELEASED";
-settings.emergencyReleasedAt = new Date();
+  await logActivitySafe({
+    userId,
+    type: "EMERGENCY_STOP_RELEASED",
+    title: "Emergency stop released",
+    description:
+      "Emergency Stop was released. Automatic trading remains stopped and requires an explicit Start action.",
+    metadata: {
+      autoTradingEnabled: false,
+    },
+  });
 
-await settings.save();
-
-await logActivitySafe({
-userId,
-type: "EMERGENCY_STOP_RELEASED",
-title: "Emergency stop released",
-description:
-"Emergency Stop was released. Automatic trading remains disabled until the user explicitly starts it.",
-});
-
-return res.status(200).json({
-success: true,
-message:
-"Emergency Stop has been released. Automatic trading is still stopped and requires an explicit Start action.",
-data: serializeSettings(settings),
-});
+  return res.status(200).json({
+    success: true,
+    message:
+      "Emergency Stop has been released. Auto-trading remains stopped. Press Start Auto Trading when you are ready.",
+    data: serializeSettings(settings),
+  });
 }
 
 /* ============================================================
