@@ -15,6 +15,20 @@ const AI_RETRY_DELAY_MS = 1_500;
 const MAX_CONTEXT_ITEMS = 100;
 const MAX_STRING_LENGTH = 2_000;
 
+/**
+
+* Confidence is represented as a percentage throughout the
+* application: 0 to 100.
+*
+* Example:
+* 80 = 80% confidence
+*
+* This avoids mixing UI values such as 80 with decimal values
+* such as 0.8.
+  */
+  const MIN_CONFIDENCE_PERCENT = 0;
+  const MAX_CONFIDENCE_PERCENT = 100;
+
 /* ============================================================
 VALIDATION
 ============================================================ */
@@ -24,11 +38,16 @@ const analysisSchema = z
 action: z.enum(["BUY", "SELL", "HOLD"]),
 
 
+/**
+ * Percentage confidence.
+ *
+ * Example: 80 means 80%.
+ */
 confidence: z
   .number()
   .finite()
-  .min(0)
-  .max(1),
+  .min(MIN_CONFIDENCE_PERCENT)
+  .max(MAX_CONFIDENCE_PERCENT),
 
 market: z
   .string()
@@ -261,20 +280,17 @@ GEMINI TRADING ANALYSIS SERVICE
 
 * Gemini is an ANALYSIS component.
 *
-* The application scheduler remains responsible for continuing
-* future analysis cycles.
-*
 * Important behavior:
 *
 * * BUY/SELL -> candidate signal for backend validation.
-* * HOLD -> no trade this cycle; analyze again next cycle.
-* * AI failure -> no trade this cycle; analyze again next cycle.
+* * HOLD -> no trade during this cycle.
+* * AI failure -> no trade during this cycle.
 *
 * Gemini cannot directly:
-* * stop the engine
-* * activate Emergency Stop
-* * change account settings
 * * execute a Deriv order
+* * change account settings
+* * stop the trading engine
+* * activate Emergency Stop
     */
     export class GeminiTradingService {
     constructor() {
@@ -318,7 +334,7 @@ GEMINI TRADING ANALYSIS SERVICE
 
 /**
 
-* Execute one AI request.
+* Execute one AI request with retry handling.
   */
   async requestAnalysis(prompt) {
   let lastError;
@@ -333,13 +349,11 @@ for (
   attempt += 1
 ) {
   try {
-    const result = await withTimeout(
+    return await withTimeout(
       this.model.generateContent(prompt),
       AI_TIMEOUT_MS,
       "Gemini market analysis timed out"
     );
-
-    return result;
   } catch (error) {
     lastError = error;
 
@@ -380,8 +394,9 @@ throw new AppError(
 
 * Generate one market analysis.
 *
-* This method does NOT decide whether a real trade is allowed.
-* AutoTradingService must independently validate the result.
+* This method produces analysis only. The AutoTradingService
+* independently validates confidence, strategy, risk, account
+* state, balance, proposal, and execution permissions.
   */
   async analyze(context) {
   let validatedContext;
@@ -441,23 +456,35 @@ Return exactly one JSON object:
 
 {
 "action": "BUY" | "SELL" | "HOLD",
-"confidence": number between 0 and 1,
+"confidence": number between 0 and 100,
 "market": "${expectedMarket}",
 "reason": "brief evidence-based explanation",
 "recommendedParameters": {}
 }
 
+CONFIDENCE FORMAT:
+
+* Confidence MUST be expressed as a percentage from 0 to 100.
+* Example: 80 means 80% confidence.
+* NEVER return decimal confidence such as 0.8.
+* Confidence describes confidence in the analytical signal.
+* Confidence is NOT a probability of profit.
+
 ANALYSIS RULES:
 
 1. Use only the supplied market data and indicators.
-2. Do not invent prices, trends, indicators, historical events, news, or account information.
-3. BUY or SELL should be returned only when the supplied data provides a coherent directional signal.
-4. HOLD means conditions are currently unclear or insufficient. HOLD DOES NOT stop the trading engine.
-5. A HOLD signal means the system should wait for the next market update and analyze again.
-6. Confidence describes confidence in the analytical signal, not the probability of profit.
+2. Do not invent prices, trends, indicators, historical events,
+   news, account information, or missing market evidence.
+3. BUY or SELL should be returned only when the supplied data
+   provides a coherent directional signal.
+4. HOLD means conditions are currently unclear or insufficient.
+5. HOLD DOES NOT stop the trading engine.
+6. A HOLD signal means the system should wait for the next market
+   update and analyze again.
 7. Never guarantee profit, winning trades, or market direction.
 8. recommendedParameters are informational and non-executable.
-9. You cannot execute trades, change settings, stop trading, or activate Emergency Stop.
+9. You cannot execute trades, change settings, stop trading, or
+   activate Emergency Stop.
 10. Return only valid JSON. Do not use Markdown.
 
 MARKET DATA:
@@ -508,8 +535,20 @@ if (returnedMarket !== expectedMarket) {
   );
 }
 
+/**
+ * HOLD must never become an executable signal merely because
+ * it has a high confidence value.
+ */
+const normalizedConfidence =
+  analysis.action === "HOLD"
+    ? 0
+    : Number(analysis.confidence);
+
 return {
   ...analysis,
+
+  confidence:
+    normalizedConfidence,
 
   market: expectedMarket,
 
@@ -518,14 +557,11 @@ return {
 
   source: "gemini",
 
-  /**
-   * Explicitly identifies that the analysis was successful.
-   * HOLD can still be a successful analysis.
-   */
   analysisAvailable: true,
 
   /**
-   * HOLD is a normal analysis outcome, not a stopped engine.
+   * HOLD is a normal analysis outcome. The scheduler continues
+   * and requests fresh analysis during future cycles.
    */
   shouldContinueAnalyzing: true,
 
@@ -539,10 +575,8 @@ return {
 
 * Safe interface used by AutoTradingService.
 *
-* CRITICAL:
 * An AI failure only skips the current execution opportunity.
-* The AutoTradingService scheduler must remain active and call
-* this method again during the next scheduled analysis cycle.
+* The scheduler remains active for future analysis cycles.
   */
   async analyzeSafely(context) {
   try {
@@ -555,6 +589,10 @@ return {
 
   return {
   action: "HOLD",
+
+  /**
+  * Percentage format: 0%.
+  */
   confidence: 0,
 
   market: normalizeMarket(
@@ -573,9 +611,6 @@ return {
 
   analysisAvailable: false,
 
-  /**
-  * The scheduler should continue normally.
-  */
   shouldContinueAnalyzing: true,
 
   errorCode:
