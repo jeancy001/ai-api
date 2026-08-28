@@ -14,51 +14,138 @@ import { decrypt } from "../utils/crypto.js";
 
 const MIN_INTERVAL = 5_000;
 const DEFAULT_INTERVAL = 15_000;
+const MIN_COOLDOWN = 0;
 
 /**
 
 * AutoTradingService
 *
-* IMPORTANT EMERGENCY-STOP POLICY:
+* IMPORTANT EMERGENCY-STOP POLICY
+* ============================================================
 *
-* This service NEVER sets `TradingSettings.emergencyStop` to true.
+* This service NEVER sets TradingSettings.emergencyStop to true.
 *
-* Ordinary conditions such as:
+* The following conditions must only skip a cycle or stop the
+* local scheduler when appropriate:
+*
 * * AI HOLD or low confidence
 * * strategy rejection
 * * risk rejection
-* * stale/unavailable market data
+* * unavailable/stale market data
 * * temporary Deriv/API errors
 * * proposal rejection
-* * a failed cycle
+* * failed analysis cycles
 *
-* must NOT automatically activate Emergency Stop.
+* Emergency Stop is a persistent, explicit user safety action.
+* When an emergency state already exists, this service respects it
+* and stops its local scheduler.
 *
-* Emergency Stop is an explicit persistent safety state managed by
-* a dedicated controller/service. When an emergency state already
-* exists, this service respects it and stops its local scheduler.
+* IMPORTANT DEPLOYMENT NOTE
+* ============================================================
+*
+* Engine state is stored in memory. This is appropriate for a
+* single long-running Node.js process.
+*
+* If the application runs multiple backend instances, use a
+* distributed scheduler/queue and distributed lock so that the
+* same user cannot receive multiple trading engines.
   */
   export class AutoTradingService {
   constructor() {
   /**
 
-  * Prevent overlapping executions for the same user.
+  * Prevent overlapping trading executions for the same user.
     */
     this.locks = new Set();
 
   /**
 
-  * Active trading engines.
+  * Prevent duplicate engine creation while start() is resolving.
+    */
+    this.starting = new Set();
+
+  /**
+
+  * Active local engines.
   *
   * Map<userId, {
   * timer: NodeJS.Timeout | null,
   * running: boolean,
   * stopped: boolean,
   * interval: number,
+  * lastExecutionAt: number | null,
   * }>
     */
     this.engines = new Map();
     }
+
+/* ============================================================
+HELPERS
+============================================================ */
+
+normalizeText(value) {
+return String(value || "").trim().toLowerCase();
+}
+
+isAccountConnected(account) {
+if (!account) {
+return false;
+}
+
+
+const status = this.normalizeText(
+  account.connectionStatus
+);
+
+return (
+  account.connected === true ||
+  status === "connected" ||
+  status === "active"
+);
+
+
+}
+
+isRealAccount(account) {
+return (
+this.normalizeText(account?.accountType) === "real"
+);
+}
+
+getConfiguredInterval(settings) {
+const configuredInterval = Number(
+settings?.tradingIntervalMs ??
+settings?.analysisInterval
+);
+
+
+if (!Number.isFinite(configuredInterval)) {
+  return DEFAULT_INTERVAL;
+}
+
+return Math.max(
+  Math.floor(configuredInterval),
+  MIN_INTERVAL
+);
+
+
+}
+
+getConfiguredCooldown(settings) {
+const cooldown = Number(settings?.cooldown ?? 0);
+
+
+if (!Number.isFinite(cooldown)) {
+  return MIN_COOLDOWN;
+}
+
+return Math.max(
+  Math.floor(cooldown),
+  MIN_COOLDOWN
+);
+
+
+}
 
 /* ============================================================
 ENGINE LIFECYCLE
@@ -68,10 +155,10 @@ ENGINE LIFECYCLE
 
 * Start the user's local trading engine.
 *
-* This method starts only the scheduler. Every cycle independently
-* validates the current database state before a trade can proceed.
+* Every cycle independently validates the persisted database
+* state before any real trade can proceed.
 *
-* This method NEVER clears or activates Emergency Stop.
+* This method never clears or activates Emergency Stop.
   */
   async start(userId) {
   const id = String(userId);
@@ -81,7 +168,10 @@ const existingEngine = this.engines.get(id);
 
 
 
-if (existingEngine && !existingEngine.stopped) {
+if (
+  existingEngine &&
+  existingEngine.stopped !== true
+) {
   return {
     started: false,
     reason: "ALREADY_RUNNING",
@@ -89,118 +179,131 @@ if (existingEngine && !existingEngine.stopped) {
   };
 }
 
-const settings = await TradingSettings.findOne({
-  userId: id,
-});
-
-if (!settings) {
-  throw new Error("Trading settings were not found");
+if (this.starting.has(id)) {
+  return {
+    started: false,
+    reason: "START_IN_PROGRESS",
+  };
 }
 
-if (!settings.autoTradingEnabled) {
-  throw new Error(
-    "Auto-trading is not enabled in the database"
-  );
-}
+this.starting.add(id);
 
-if (!settings.realTradingAuthorized) {
-  throw new Error(
-    "Real-money trading has not been authorized"
-  );
-}
+try {
+  const settings = await TradingSettings.findOne({
+    userId: id,
+  });
 
-/**
- * Respect an existing emergency state, but never modify it here.
- */
-if (settings.emergencyStop === true) {
-  throw new Error(
-    "Emergency Stop is active. Reset it before starting trading."
-  );
-}
-
-if (!settings.selectedMarket?.trim()) {
-  throw new Error(
-    "A Deriv market must be selected before trading can start"
-  );
-}
-
-const configuredInterval = Number(
-  settings.tradingIntervalMs ??
-    settings.analysisInterval
-);
-
-const interval = Number.isFinite(configuredInterval)
-  ? Math.max(configuredInterval, MIN_INTERVAL)
-  : DEFAULT_INTERVAL;
-
-const engine = {
-  timer: null,
-  running: false,
-  stopped: false,
-  interval,
-};
-
-this.engines.set(id, engine);
-
-const executeCycle = async () => {
-  if (engine.stopped || engine.running) {
-    return;
-  }
-
-  engine.running = true;
-
-  try {
-    /**
-     * A failed cycle is logged and skipped.
-     *
-     * DO NOT activate Emergency Stop automatically here.
-     * The next scheduled cycle may continue normally.
-     */
-    await this.runUserCycle(id);
-  } catch (error) {
-    console.error(
-      `Auto-trading cycle failed for user ${id}:`,
-      error?.message || error
+  if (!settings) {
+    throw new Error(
+      "Trading settings were not found"
     );
-  } finally {
-    engine.running = false;
   }
-};
 
-/**
- * Run the first cycle immediately.
- */
-void executeCycle();
+  if (settings.autoTradingEnabled !== true) {
+    throw new Error(
+      "Auto-trading is not enabled in the database"
+    );
+  }
 
-engine.timer = setInterval(() => {
+  if (settings.realTradingAuthorized !== true) {
+    throw new Error(
+      "Real-money trading has not been authorized"
+    );
+  }
+
+  if (settings.emergencyStop === true) {
+    throw new Error(
+      "Emergency Stop is active. Release it before starting trading."
+    );
+  }
+
+  if (!settings.selectedMarket?.trim()) {
+    throw new Error(
+      "A Deriv market must be selected before trading can start"
+    );
+  }
+
+  const interval =
+    this.getConfiguredInterval(settings);
+
+  const engine = {
+    timer: null,
+    running: false,
+    stopped: false,
+    interval,
+    lastExecutionAt: null,
+  };
+
+  /**
+   * Register the engine before scheduling the first cycle.
+   * This makes isRunning() immediately consistent.
+   */
+  this.engines.set(id, engine);
+
+  const executeCycle = async () => {
+    if (
+      engine.stopped ||
+      engine.running ||
+      this.engines.get(id) !== engine
+    ) {
+      return;
+    }
+
+    engine.running = true;
+
+    try {
+      await this.runUserCycle(id);
+    } catch (error) {
+      /**
+       * A failed cycle is isolated.
+       *
+       * Never activate Emergency Stop automatically.
+       */
+      console.error(
+        `Auto-trading cycle failed for user ${id}:`,
+        error?.message || error
+      );
+    } finally {
+      engine.running = false;
+    }
+  };
+
+  /**
+   * Start immediately. Errors are contained inside executeCycle.
+   */
   void executeCycle();
-}, interval);
 
-return {
-  started: true,
-  interval,
-};
+  engine.timer = setInterval(() => {
+    void executeCycle();
+  }, interval);
+
+  return {
+    started: true,
+    interval,
+  };
+} finally {
+  this.starting.delete(id);
+}
 
 
 }
 
 /**
 
-* Stop the user's local trading engine immediately.
+* Stop the user's local trading scheduler.
 *
-* IMPORTANT:
-* This only stops the in-memory scheduler. It does NOT activate
-* Emergency Stop and does NOT modify persistent settings.
+* This does not activate Emergency Stop and does not modify
+* persistent database settings.
   */
   async stop(userId, reason = "STOPPED") {
   const id = String(userId);
-  const engine = this.engines.get(id);
+
+
+const engine = this.engines.get(id);
+
 
 
 if (!engine) {
-
-
-
   return {
     stopped: false,
     reason: "NOT_RUNNING",
@@ -214,7 +317,12 @@ if (engine.timer) {
   engine.timer = null;
 }
 
-this.engines.delete(id);
+/**
+ * Delete only if this is still the same engine instance.
+ */
+if (this.engines.get(id) === engine) {
+  this.engines.delete(id);
+}
 
 return {
   stopped: true,
@@ -226,11 +334,11 @@ return {
 
 /**
 
-* Backward-compatible method used when another trusted part of the
-* backend has ALREADY activated Emergency Stop.
+* Compatibility method.
 *
-* This method only stops the local scheduler.
-* It NEVER writes emergencyStop=true to the database.
+* Another trusted controller may already have activated the
+* persistent Emergency Stop. This method only stops the local
+* scheduler and never writes emergencyStop=true.
   */
   async emergencyStop(
   userId,
@@ -242,13 +350,19 @@ return {
 /**
 
 * Returns whether this application instance currently has an
-* active engine for the user.
+* active local engine for the user.
   */
   isRunning(userId) {
   const engine = this.engines.get(String(userId));
 
 
-return Boolean(engine && !engine.stopped);
+return Boolean(
+
+
+
+  engine &&
+  engine.stopped !== true
+);
 
 
 }
@@ -278,7 +392,6 @@ if (!this.isRunning(id)) {
 const account = await DerivAccount.findOne({
   userId: id,
   selected: true,
-  connected: true,
 });
 
 if (!account) {
@@ -288,11 +401,14 @@ if (!account) {
   };
 }
 
-if (
-  String(account.accountType || "")
-    .trim()
-    .toLowerCase() !== "real"
-) {
+if (!this.isAccountConnected(account)) {
+  return {
+    skipped: true,
+    reason: "DERIV_ACCOUNT_NOT_CONNECTED",
+  };
+}
+
+if (!this.isRealAccount(account)) {
   return {
     skipped: true,
     reason: "NOT_REAL_ACCOUNT",
@@ -316,7 +432,9 @@ if (!account.encryptedAccessToken) {
 let accessToken;
 
 try {
-  accessToken = decrypt(account.encryptedAccessToken);
+  accessToken = decrypt(
+    account.encryptedAccessToken
+  );
 } catch (error) {
   console.error(
     `Unable to decrypt Deriv access token for user ${id}:`,
@@ -345,8 +463,8 @@ PROTECTED TRADING CYCLE
 
 * Execute one protected trading cycle.
 *
-* Rejections and ordinary failures skip the current cycle.
-* They do NOT activate Emergency Stop.
+* Ordinary failures and rejections skip only the current cycle.
+* They never activate Emergency Stop automatically.
   */
   async runOnce({ userId, accessToken }) {
   const id = String(userId);
@@ -372,11 +490,12 @@ try {
     };
   }
 
+  const engine = this.engines.get(id);
+
   const [account, settings] = await Promise.all([
     DerivAccount.findOne({
       userId: id,
       selected: true,
-      connected: true,
     }),
 
     TradingSettings.findOne({
@@ -395,14 +514,16 @@ try {
      SAFETY CHECKS — EVERY CYCLE
   -------------------------------------------------------- */
 
-  if (!settings.autoTradingEnabled) {
+  if (settings.autoTradingEnabled !== true) {
     return {
       skipped: true,
       reason: "AUTO_TRADING_DISABLED",
     };
   }
 
-  if (!settings.realTradingAuthorized) {
+  if (
+    settings.realTradingAuthorized !== true
+  ) {
     return {
       skipped: true,
       reason: "REAL_TRADING_NOT_AUTHORIZED",
@@ -410,14 +531,13 @@ try {
   }
 
   /**
-   * Respect a persistent emergency state if one was explicitly
-   * activated elsewhere.
-   *
-   * We stop only the local scheduler. This service does not create,
-   * reset, or modify the emergency state.
+   * Respect an emergency state created explicitly elsewhere.
    */
   if (settings.emergencyStop === true) {
-    await this.stop(id, "EMERGENCY_STOP_ACTIVE");
+    await this.stop(
+      id,
+      "EMERGENCY_STOP_ACTIVE"
+    );
 
     return {
       skipped: true,
@@ -425,11 +545,14 @@ try {
     };
   }
 
-  if (
-    String(account.accountType || "")
-      .trim()
-      .toLowerCase() !== "real"
-  ) {
+  if (!this.isAccountConnected(account)) {
+    return {
+      skipped: true,
+      reason: "DERIV_ACCOUNT_NOT_CONNECTED",
+    };
+  }
+
+  if (!this.isRealAccount(account)) {
     return {
       skipped: true,
       reason: "NOT_REAL_ACCOUNT",
@@ -453,8 +576,27 @@ try {
     };
   }
 
+  /**
+   * Enforce cooldown between actual executions.
+   */
+  const cooldown =
+    this.getConfiguredCooldown(settings);
+
+  if (
+    cooldown > 0 &&
+    engine?.lastExecutionAt &&
+    Date.now() - engine.lastExecutionAt < cooldown
+  ) {
+    return {
+      skipped: true,
+      reason: "COOLDOWN_ACTIVE",
+    };
+  }
+
   const symbol =
-    await derivMarketService.symbol(selectedMarket);
+    await derivMarketService.symbol(
+      selectedMarket
+    );
 
   if (!symbol?.symbol) {
     return {
@@ -470,6 +612,10 @@ try {
     };
   }
 
+  /* --------------------------------------------------------
+     LIVE BALANCE + MARKET DATA
+  -------------------------------------------------------- */
+
   const [balance, market] = await Promise.all([
     derivBalanceService.get(
       account.derivAccountId,
@@ -483,7 +629,9 @@ try {
     ),
   ]);
 
-  const numericBalance = Number(balance?.balance);
+  const numericBalance = Number(
+    balance?.balance
+  );
 
   if (!Number.isFinite(numericBalance)) {
     return {
@@ -492,7 +640,9 @@ try {
     };
   }
 
-  const currentPrice = Number(market?.quote);
+  const currentPrice = Number(
+    market?.quote
+  );
 
   if (
     !Number.isFinite(currentPrice) ||
@@ -528,8 +678,11 @@ try {
   );
 
   if (
-    !Number.isFinite(Number(analysis?.confidence)) ||
-    Number(analysis.confidence) < confidenceThreshold
+    !Number.isFinite(
+      Number(analysis?.confidence)
+    ) ||
+    Number(analysis.confidence) <
+      confidenceThreshold
   ) {
     return {
       skipped: true,
@@ -547,8 +700,10 @@ try {
       analysis,
       market,
       {
-        minimumConfidence: confidenceThreshold,
-        expectedSymbol: selectedMarket,
+        minimumConfidence:
+          confidenceThreshold,
+        expectedSymbol:
+          selectedMarket,
       }
     );
 
@@ -563,7 +718,14 @@ try {
     };
   }
 
+  /* --------------------------------------------------------
+     STAKE VALIDATION
+  -------------------------------------------------------- */
+
   const stake = Number(settings.stake);
+  const maxStake = Number(
+    settings.maxStake
+  );
 
   if (
     !Number.isFinite(stake) ||
@@ -572,6 +734,28 @@ try {
     return {
       skipped: true,
       reason: "INVALID_STAKE",
+    };
+  }
+
+  /**
+   * Defensive limit in the execution service.
+   * RiskManagementService should also enforce limits.
+   */
+  if (
+    Number.isFinite(maxStake) &&
+    maxStake > 0 &&
+    stake > maxStake
+  ) {
+    return {
+      skipped: true,
+      reason: "STAKE_EXCEEDS_MAX_STAKE",
+    };
+  }
+
+  if (stake > numericBalance) {
+    return {
+      skipped: true,
+      reason: "INSUFFICIENT_BALANCE",
     };
   }
 
@@ -614,12 +798,17 @@ try {
       settings,
       analysis,
       symbol,
+      currency:
+        balance?.currency ||
+        account.currency ||
+        null,
     });
 
   if (!contractParameters) {
     return {
       skipped: true,
-      reason: "CONTRACT_PARAMETERS_REQUIRED",
+      reason:
+        "CONTRACT_PARAMETERS_REQUIRED",
       analysis,
       risk,
     };
@@ -643,7 +832,9 @@ try {
     };
   }
 
-  const proposalPrice = Number(proposal.ask_price);
+  const proposalPrice = Number(
+    proposal.ask_price
+  );
 
   if (
     !Number.isFinite(proposalPrice) ||
@@ -655,8 +846,22 @@ try {
     };
   }
 
+  /**
+   * Never purchase above the configured stake limit when the
+   * basis is stake.
+   */
+  if (
+    contractParameters.basis === "stake" &&
+    proposalPrice > stake
+  ) {
+    return {
+      skipped: true,
+      reason: "PROPOSAL_PRICE_EXCEEDS_STAKE",
+    };
+  }
+
   /* --------------------------------------------------------
-     FINAL SAFETY CHECK — BEFORE PURCHASE
+     FINAL DATABASE SAFETY CHECK — BEFORE PURCHASE
   -------------------------------------------------------- */
 
   const [finalSettings, finalAccount] =
@@ -668,7 +873,6 @@ try {
       DerivAccount.findOne({
         userId: id,
         selected: true,
-        connected: true,
       }).lean(),
     ]);
 
@@ -678,16 +882,18 @@ try {
   ) {
     return {
       skipped: true,
-      reason: "TRADING_STATE_CHANGED_BEFORE_EXECUTION",
+      reason:
+        "TRADING_STATE_CHANGED_BEFORE_EXECUTION",
     };
   }
 
-  /**
-   * An Emergency Stop activated by the user elsewhere is always
-   * respected, but this cycle does not create that emergency state.
-   */
-  if (finalSettings.emergencyStop === true) {
-    await this.stop(id, "EMERGENCY_STOP_ACTIVE");
+  if (
+    finalSettings.emergencyStop === true
+  ) {
+    await this.stop(
+      id,
+      "EMERGENCY_STOP_ACTIVE"
+    );
 
     return {
       skipped: true,
@@ -697,22 +903,24 @@ try {
 
   if (
     !finalAccount ||
-    String(finalAccount.accountType || "")
-      .trim()
-      .toLowerCase() !== "real" ||
-    String(finalAccount.derivAccountId) !==
-      String(account.derivAccountId)
+    !this.isAccountConnected(finalAccount) ||
+    !this.isRealAccount(finalAccount) ||
+    String(
+      finalAccount.derivAccountId
+    ) !== String(account.derivAccountId)
   ) {
     return {
       skipped: true,
-      reason: "ACCOUNT_STATE_CHANGED_BEFORE_EXECUTION",
+      reason:
+        "ACCOUNT_STATE_CHANGED_BEFORE_EXECUTION",
     };
   }
 
   if (!this.isRunning(id)) {
     return {
       skipped: true,
-      reason: "ENGINE_STOPPED_BEFORE_EXECUTION",
+      reason:
+        "ENGINE_STOPPED_BEFORE_EXECUTION",
     };
   }
 
@@ -722,7 +930,8 @@ try {
 
   const purchase =
     await tradeExecutionService.buy({
-      accountId: account.derivAccountId,
+      accountId:
+        account.derivAccountId,
       token: accessToken,
       proposalId: proposal.id,
       price: proposalPrice,
@@ -735,9 +944,8 @@ try {
 
   if (!derivContractId) {
     /**
-     * This is an execution inconsistency and should be logged by
-     * the caller. It still does NOT automatically activate
-     * Emergency Stop.
+     * A purchase response without a contract ID is an execution
+     * inconsistency. Do not activate Emergency Stop automatically.
      */
     throw new Error(
       "Deriv purchase completed without a contract identifier"
@@ -745,33 +953,85 @@ try {
   }
 
   /**
-   * Record the trade only after the real purchase succeeds.
+   * Mark execution time immediately after successful purchase.
+   * This prevents the next cycle from executing again before
+   * cooldown begins.
    */
-  const trade =
-    await tradeExecutionService.record({
-      userId: id,
-      derivAccountId: account.derivAccountId,
-      derivContractId: String(derivContractId),
-      market: selectedMarket,
-      action: analysis.action,
-      stake,
-      currency: balance?.currency || null,
-      status: "open",
-      entryPrice: currentPrice,
-      openedAt: new Date(),
-      metadata: {
-        aiConfidence: Number(analysis.confidence),
-        aiReason: analysis.reason || null,
-        strategyReasons: strategy.reasons || [],
-        proposalId: proposal.id,
-      },
-    });
+  const activeEngine =
+    this.engines.get(id);
+
+  if (activeEngine) {
+    activeEngine.lastExecutionAt = Date.now();
+  }
+
+  /* --------------------------------------------------------
+     RECORD SUCCESSFUL REAL TRADE
+  -------------------------------------------------------- */
+
+  let trade;
+
+  try {
+    trade =
+      await tradeExecutionService.record({
+        userId: id,
+        derivAccountId:
+          account.derivAccountId,
+        derivContractId:
+          String(derivContractId),
+        market: selectedMarket,
+        action: analysis.action,
+        contractType:
+          contractParameters.contract_type,
+        stake,
+        currency:
+          balance?.currency ||
+          account.currency ||
+          null,
+        status: "open",
+        entryPrice: currentPrice,
+        openedAt: new Date(),
+        metadata: {
+          aiConfidence:
+            Number(analysis.confidence),
+          aiReason:
+            analysis.reason || null,
+          strategyReasons:
+            strategy.reasons || [],
+          proposalId: proposal.id,
+        },
+      });
+  } catch (recordError) {
+    /**
+     * CRITICAL:
+     * The real purchase has already happened.
+     *
+     * Do not retry the purchase and do not automatically activate
+     * Emergency Stop. Surface the reconciliation issue clearly.
+     */
+    console.error(
+      `Real trade ${derivContractId} was purchased but could not be recorded for user ${id}:`,
+      recordError?.message || recordError
+    );
+
+    return {
+      skipped: false,
+      executed: true,
+      recorded: false,
+      reconciliationRequired: true,
+      derivContractId:
+        String(derivContractId),
+      analysis,
+      risk,
+    };
+  }
 
   return {
     skipped: false,
     executed: true,
+    recorded: true,
     tradeId: trade?._id || null,
-    derivContractId: String(derivContractId),
+    derivContractId:
+      String(derivContractId),
     analysis,
     risk,
   };
@@ -789,18 +1049,20 @@ CONTRACT CONFIGURATION
 /**
 
 * Build contract parameters exclusively from explicitly configured
-* and backend-approved settings.
+* backend settings.
 *
-* AI analysis never receives authority to invent arbitrary Deriv
-* API parameters.
+* AI analysis never receives authority to invent arbitrary
+* Deriv API parameters.
   */
   buildContractParameters({
   settings,
   analysis,
   symbol,
+  currency,
   }) {
-  const contractType =
-  String(settings.contractType || "")
+  const contractType = String(
+  settings.contractType || ""
+  )
   .trim()
   .toUpperCase();
 
@@ -812,19 +1074,19 @@ const duration = Number(
   settings.contractDuration
 );
 
-const durationUnit =
-  String(
-    settings.contractDurationUnit || ""
-  )
-    .trim()
-    .toLowerCase();
+const durationUnit = String(
+  settings.contractDurationUnit || ""
+)
+  .trim()
+  .toLowerCase();
 
 const amount = Number(settings.stake);
 
-const basis =
-  String(settings.stakeBasis || "stake")
-    .trim()
-    .toLowerCase();
+const basis = String(
+  settings.stakeBasis || "stake"
+)
+  .trim()
+  .toLowerCase();
 
 if (
   !contractType ||
@@ -838,6 +1100,10 @@ if (
   return null;
 }
 
+/**
+ * Keep duration units restricted to values supported by your
+ * backend's Deriv contract configuration.
+ */
 const allowedDurationUnits = new Set([
   "s",
   "m",
@@ -846,7 +1112,11 @@ const allowedDurationUnits = new Set([
   "t",
 ]);
 
-if (!allowedDurationUnits.has(durationUnit)) {
+if (
+  !allowedDurationUnits.has(
+    durationUnit
+  )
+) {
   return null;
 }
 
@@ -857,14 +1127,18 @@ if (
   return null;
 }
 
+const normalizedCurrency = String(
+  currency || ""
+)
+  .trim()
+  .toUpperCase();
+
 const parameters = {
   amount,
   basis,
   contract_type: contractType,
   currency:
-    String(settings.currency || "")
-      .trim()
-      .toUpperCase() || undefined,
+    normalizedCurrency || undefined,
   duration,
   duration_unit: durationUnit,
   symbol: symbol.symbol,
@@ -872,7 +1146,10 @@ const parameters = {
 
 return Object.fromEntries(
   Object.entries(parameters).filter(
-    ([, value]) => value !== undefined
+    ([, value]) =>
+      value !== undefined &&
+      value !== null &&
+      value !== ""
   )
 );
 
@@ -887,10 +1164,14 @@ APPLICATION SHUTDOWN
 
 * Stop every local engine.
 *
-* This only stops local timers and NEVER activates Emergency Stop.
+* This only stops local timers and never activates Emergency Stop.
   */
-  async stopAll(reason = "APPLICATION_SHUTDOWN") {
-  const userIds = [...this.engines.keys()];
+  async stopAll(
+  reason = "APPLICATION_SHUTDOWN"
+  ) {
+  const userIds = [
+  ...this.engines.keys(),
+  ];
 
 
 await Promise.all(
