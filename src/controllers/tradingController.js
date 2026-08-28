@@ -1,8 +1,11 @@
 import { TradingSettings } from "../models/TradingSettings.js";
 import { Trade } from "../models/Trade.js";
 import { DerivAccount } from "../models/DerivAccount.js";
+
 import { AppError } from "../utils/AppError.js";
+
 import { autoTradingService } from "../services/AutoTradingService.js";
+import { derivMarketService } from "../services/DerivMarketService.js";
 import { logActivitySafe } from "../services/ActivityService.js";
 
 const REAL_AUTH_CONFIRMATION =
@@ -22,7 +25,7 @@ function getUserId(req) {
     throw new AppError(
       "Authentication required",
       401,
-      "UNAUTHORIZED",
+      "UNAUTHORIZED"
     );
   }
 
@@ -37,10 +40,41 @@ function serializeSettings(settings) {
     : settings;
 }
 
+function normalizeText(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * A connected account can be represented either by the explicit
+ * boolean or by the connection status returned by the backend.
+ */
+function isAccountConnected(account) {
+  if (!account) return false;
+
+  const status = normalizeText(
+    account.connectionStatus
+  );
+
+  return (
+    account.connected === true ||
+    status === "connected" ||
+    status === "active"
+  );
+}
+
 function defaultSettings(userId) {
   return {
     userId,
+
     selectedMarket: null,
+
+    // Explicit contract configuration.
+    contractType: null,
+    contractDuration: null,
+    contractDurationUnit: null,
+    stakeBasis: "stake",
 
     // Safety defaults.
     autoTradingEnabled: false,
@@ -53,24 +87,41 @@ function defaultSettings(userId) {
     maxDailyLoss: 10,
     maxDailyTrades: 10,
     maxConsecutiveLosses: 3,
+
     aiConfidenceThreshold: 0.7,
+
+    // AutoTradingService currently reads tradingIntervalMs.
+    tradingIntervalMs: 15000,
+
+    // Keep compatibility with existing settings if used elsewhere.
     analysisInterval: 15000,
     cooldown: 5000,
+
+    stopReason: null,
   };
 }
 
 async function getSettings(userId) {
-  let settings = await TradingSettings.findOne({ userId });
+  let settings = await TradingSettings.findOne({
+    userId,
+  });
 
   if (!settings) {
     settings = await TradingSettings.create(
-      defaultSettings(userId),
+      defaultSettings(userId)
     );
   }
 
   return settings;
 }
 
+/**
+ * Return the explicitly selected REAL Deriv account.
+ *
+ * We do not require the `connected` field in the MongoDB query because
+ * older account documents may represent connectivity through
+ * connectionStatus instead.
+ */
 async function getSelectedRealAccountOrThrow(userId) {
   const account = await DerivAccount.findOne({
     userId,
@@ -81,39 +132,35 @@ async function getSelectedRealAccountOrThrow(userId) {
     throw new AppError(
       "Please connect and select a Deriv account before continuing",
       400,
-      "DERIV_ACCOUNT_NOT_SELECTED",
+      "DERIV_ACCOUNT_NOT_SELECTED"
     );
   }
 
-  const accountType = String(
-    account.accountType || "",
-  )
-    .trim()
-    .toLowerCase();
+  if (!account.derivAccountId) {
+    throw new AppError(
+      "The selected Deriv account does not have a valid Deriv account ID",
+      400,
+      "DERIV_ACCOUNT_ID_MISSING"
+    );
+  }
+
+  const accountType = normalizeText(
+    account.accountType
+  );
 
   if (accountType !== "real") {
     throw new AppError(
-      "Only a real Deriv account can be used for live auto-trading",
+      "Only a REAL Deriv account can be used for live auto-trading",
       403,
-      "NOT_REAL_ACCOUNT",
+      "NOT_REAL_ACCOUNT"
     );
   }
 
-  const connectionStatus = String(
-    account.connectionStatus || "",
-  )
-    .trim()
-    .toLowerCase();
-
-  if (
-    account.connected === false ||
-    (connectionStatus &&
-      connectionStatus !== "connected")
-  ) {
+  if (!isAccountConnected(account)) {
     throw new AppError(
       "The selected Deriv account is not connected",
       403,
-      "DERIV_ACCOUNT_NOT_CONNECTED",
+      "DERIV_ACCOUNT_NOT_CONNECTED"
     );
   }
 
@@ -121,11 +168,45 @@ async function getSelectedRealAccountOrThrow(userId) {
 }
 
 /**
+ * Validate the selected market against the backend's Deriv market
+ * service before allowing the trading engine to start.
+ */
+async function validateSelectedMarketOrThrow(
+  settings
+) {
+  const market = String(
+    settings.selectedMarket || ""
+  ).trim();
+
+  if (!market) {
+    throw new AppError(
+      "Please select a market before starting auto-trading",
+      400,
+      "MARKET_NOT_SELECTED"
+    );
+  }
+
+  const symbol = await derivMarketService.symbol(
+    market
+  );
+
+  if (!symbol) {
+    throw new AppError(
+      "The selected market is currently unavailable on Deriv",
+      400,
+      "MARKET_UNAVAILABLE"
+    );
+  }
+
+  return symbol;
+}
+
+/**
  * Stop the in-memory trading worker.
  *
- * The database is disabled before this method is called, so a worker
- * that wakes up during shutdown must independently see the disabled
- * state and refuse to execute a new trade.
+ * IMPORTANT:
+ * AutoTradingService.stop(userId, reason) expects positional
+ * arguments, not an object.
  */
 async function stopEngineSafely(userId, reason) {
   if (
@@ -133,23 +214,19 @@ async function stopEngineSafely(userId, reason) {
     typeof autoTradingService.stop !== "function"
   ) {
     console.warn(
-      "AutoTradingService.stop() is not available",
+      "AutoTradingService.stop() is not available"
     );
 
     return false;
   }
 
   try {
-    await autoTradingService.stop({
-      userId,
-      reason,
-    });
-
+    await autoTradingService.stop(userId, reason);
     return true;
   } catch (error) {
     console.error(
       "Trading engine stop failed:",
-      error?.message || error,
+      error?.message || error
     );
 
     return false;
@@ -179,33 +256,41 @@ export async function status(req, res) {
           "connected",
           "connectionStatus",
           "lastVerifiedAt",
-        ].join(" "),
+        ].join(" ")
       )
       .lean(),
   ]);
 
   return res.status(200).json({
     success: true,
+
     data: {
       settings: serializeSettings(settings),
 
       account: account
         ? {
+            // Legacy compatibility.
             accountId: account.derivAccountId,
-            derivAccountId: account.derivAccountId,
+
+            // Canonical Deriv account ID.
+            derivAccountId:
+              account.derivAccountId,
+
             accountType: account.accountType,
             currency: account.currency,
-            selected: account.selected === true,
+
+            selected:
+              account.selected === true,
+
             connected:
-              account.connected === true ||
-              String(
-                account.connectionStatus || "",
-              ).toLowerCase() === "connected",
+              isAccountConnected(account),
+
             connectionStatus:
               account.connectionStatus ||
-              (account.connected
+              (isAccountConnected(account)
                 ? "connected"
                 : "disconnected"),
+
             lastVerifiedAt:
               account.lastVerifiedAt || null,
           }
@@ -230,7 +315,7 @@ export async function authorizeReal(req, res) {
     throw new AppError(
       `Explicit confirmation is required. Please confirm with: ${REAL_AUTH_CONFIRMATION}`,
       400,
-      "REAL_AUTH_CONFIRMATION_REQUIRED",
+      "REAL_AUTH_CONFIRMATION_REQUIRED"
     );
   }
 
@@ -239,9 +324,22 @@ export async function authorizeReal(req, res) {
 
   const settings = await getSettings(userId);
 
+  /**
+   * Emergency Stop intentionally blocks authorization actions.
+   * The user must explicitly release the emergency state first.
+   */
+  if (settings.emergencyStop) {
+    throw new AppError(
+      "Real-money authorization is unavailable while Emergency Stop is active",
+      409,
+      "EMERGENCY_STOP_ACTIVE"
+    );
+  }
+
   if (!settings.realTradingAuthorized) {
     settings.realTradingAuthorized = true;
-    settings.realTradingAuthorizedAt = new Date();
+    settings.realTradingAuthorizedAt =
+      new Date();
 
     await settings.save();
 
@@ -260,8 +358,10 @@ export async function authorizeReal(req, res) {
 
   return res.status(200).json({
     success: true,
+
     message:
       "Real-money auto-trading has been authorized. Trading remains stopped until you explicitly start it.",
+
     data: serializeSettings(settings),
   });
 }
@@ -279,40 +379,40 @@ export async function start(req, res) {
     throw new AppError(
       "Real-money trading must be explicitly authorized first",
       400,
-      "REAL_AUTH_REQUIRED",
+      "REAL_AUTH_REQUIRED"
     );
   }
 
   if (settings.emergencyStop) {
     throw new AppError(
-      "Trading cannot start while emergency stop is active",
+      "Trading cannot start while Emergency Stop is active",
       409,
-      "EMERGENCY_STOP_ACTIVE",
-    );
-  }
-
-  if (!settings.selectedMarket) {
-    throw new AppError(
-      "Please select a market before starting auto-trading",
-      400,
-      "MARKET_NOT_SELECTED",
+      "EMERGENCY_STOP_ACTIVE"
     );
   }
 
   const account =
     await getSelectedRealAccountOrThrow(userId);
 
+  await validateSelectedMarketOrThrow(settings);
+
+  /**
+   * If the database says trading is enabled and a local engine is
+   * already running, do not create another scheduler.
+   */
   if (settings.autoTradingEnabled) {
     return res.status(200).json({
       success: true,
-      message: "Auto-trading is already running",
+      message:
+        "Auto-trading is already enabled",
+
       data: serializeSettings(settings),
     });
   }
 
   /*
-   * Enable the database flag before starting the engine.
-   * The engine must independently verify this flag on every cycle.
+   * Enable the persistent safety flag before starting the scheduler.
+   * Every cycle independently verifies this flag.
    */
   settings.autoTradingEnabled = true;
   settings.stopReason = null;
@@ -326,14 +426,31 @@ export async function start(req, res) {
       typeof autoTradingService.start !== "function"
     ) {
       throw new Error(
-        "AutoTradingService.start() is not implemented",
+        "AutoTradingService.start() is not implemented"
       );
     }
 
-    await autoTradingService.start({
-      userId,
-    });
+    /**
+     * IMPORTANT:
+     * AutoTradingService.start(userId) expects the user ID directly.
+     */
+    const engineResult =
+      await autoTradingService.start(userId);
+
+    if (
+      engineResult?.started === false &&
+      engineResult?.reason !== "ALREADY_RUNNING"
+    ) {
+      throw new Error(
+        engineResult?.reason ||
+          "The trading engine could not start"
+      );
+    }
+
   } catch (error) {
+    /*
+     * Roll back the database flag if the scheduler failed to start.
+     */
     settings.autoTradingEnabled = false;
     settings.stopReason = "ENGINE_START_FAILED";
 
@@ -356,7 +473,7 @@ export async function start(req, res) {
       error?.message ||
         "Unable to start the auto-trading engine",
       500,
-      "AUTO_TRADING_START_FAILED",
+      "AUTO_TRADING_START_FAILED"
     );
   }
 
@@ -385,10 +502,11 @@ export async function start(req, res) {
 
 export async function stop(req, res) {
   const userId = getUserId(req);
+
   const settings = await getSettings(userId);
 
   /*
-   * Safety first: persist the block before stopping the worker.
+   * Safety first: persist the block before stopping the scheduler.
    */
   settings.autoTradingEnabled = false;
   settings.stopReason = "USER_REQUESTED_STOP";
@@ -397,7 +515,7 @@ export async function stop(req, res) {
 
   const engineStopped = await stopEngineSafely(
     userId,
-    "USER_REQUESTED_STOP",
+    "USER_REQUESTED_STOP"
   );
 
   await logActivitySafe({
@@ -413,8 +531,10 @@ export async function stop(req, res) {
 
   return res.status(200).json({
     success: true,
+
     message:
       "Auto-trading has been disabled. New automated trades are blocked.",
+
     data: serializeSettings(settings),
   });
 }
@@ -425,10 +545,15 @@ export async function stop(req, res) {
 
 export async function emergency(req, res) {
   const userId = getUserId(req);
+
   const settings = await getSettings(userId);
 
   /*
    * Highest-priority safety operation.
+   *
+   * Persist the emergency block FIRST. Even if the process takes a
+   * moment to stop the scheduler, the next cycle will see this flag
+   * and refuse execution.
    */
   settings.autoTradingEnabled = false;
   settings.emergencyStop = true;
@@ -439,7 +564,7 @@ export async function emergency(req, res) {
 
   const engineStopped = await stopEngineSafely(
     userId,
-    "EMERGENCY_STOP",
+    "EMERGENCY_STOP"
   );
 
   await logActivitySafe({
@@ -455,8 +580,61 @@ export async function emergency(req, res) {
 
   return res.status(200).json({
     success: true,
+
     message:
-      "Emergency stop activated. Automatic trading is blocked.",
+      "Emergency Stop activated. Automatic trading is blocked until Emergency Stop is explicitly released.",
+
+    data: serializeSettings(settings),
+  });
+}
+
+/* ============================================================
+   POST /trading/release-emergency-stop
+
+   Releasing Emergency Stop DOES NOT start trading.
+   The user must explicitly press Start afterwards.
+============================================================ */
+
+export async function releaseEmergencyStop(req, res) {
+  const userId = getUserId(req);
+
+  const settings = await getSettings(userId);
+
+  if (!settings.emergencyStop) {
+    return res.status(200).json({
+      success: true,
+      message: "Emergency Stop is not active",
+      data: serializeSettings(settings),
+    });
+  }
+
+  /**
+   * Verify that the selected account is still valid before removing
+   * the safety block. This still does not start trading.
+   */
+  await getSelectedRealAccountOrThrow(userId);
+
+  settings.autoTradingEnabled = false;
+  settings.emergencyStop = false;
+  settings.stopReason = "EMERGENCY_STOP_RELEASED";
+  settings.emergencyReleasedAt = new Date();
+
+  await settings.save();
+
+  await logActivitySafe({
+    userId,
+    type: "EMERGENCY_STOP_RELEASED",
+    title: "Emergency stop released",
+    description:
+      "Emergency Stop was released. Automatic trading remains stopped until explicitly started.",
+  });
+
+  return res.status(200).json({
+    success: true,
+
+    message:
+      "Emergency Stop has been released. Automatic trading remains stopped and requires an explicit Start action.",
+
     data: serializeSettings(settings),
   });
 }
@@ -468,12 +646,14 @@ export async function emergency(req, res) {
 export async function trades(req, res) {
   const userId = getUserId(req);
 
-  const requestedLimit = Number(req.query.limit);
+  const requestedLimit = Number(
+    req.query.limit
+  );
 
   const limit = Number.isFinite(requestedLimit)
     ? Math.min(
         Math.max(Math.floor(requestedLimit), 1),
-        100,
+        100
       )
     : 50;
 
@@ -505,7 +685,7 @@ export async function trade(req, res) {
     throw new AppError(
       "Trade not found",
       404,
-      "TRADE_NOT_FOUND",
+      "TRADE_NOT_FOUND"
     );
   }
 
