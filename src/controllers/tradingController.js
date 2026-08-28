@@ -46,13 +46,8 @@ return String(value || "")
 .toLowerCase();
 }
 
-/**
-
-* A connected account can be represented either by the explicit
-* boolean or by the connection status returned by the backend.
-  */
-  function isAccountConnected(account) {
-  if (!account) return false;
+function isAccountConnected(account) {
+if (!account) return false;
 
 const status = normalizeText(
 account.connectionStatus
@@ -64,6 +59,33 @@ status === "connected" ||
 status === "active"
 );
 }
+
+/**
+
+* Safely check whether the in-memory trading engine is running.
+*
+* MongoDB remains the source of truth for permission to trade.
+* This value is primarily used to detect scheduler/state mismatches.
+  */
+  function isEngineRunning(userId) {
+  try {
+  if (
+  !autoTradingService ||
+  typeof autoTradingService.isRunning !== "function"
+  ) {
+  return false;
+  }
+
+  return autoTradingService.isRunning(userId) === true;
+  } catch (error) {
+  console.error(
+  "Unable to determine trading engine state:",
+  error?.message || error
+  );
+
+  return false;
+  }
+  }
 
 function defaultSettings(userId) {
 return {
@@ -199,9 +221,11 @@ return symbol;
 
 * Stop the local scheduler safely.
 *
-* The database safety state is always the source of truth.
-* Failure to stop an in-memory scheduler must not undo a
-* persistent safety block.
+* IMPORTANT:
+* MongoDB safety state is persisted before calling this function.
+* Therefore, even if the process-level scheduler fails to stop,
+* future execution cycles must independently see that trading is
+* disabled and refuse to execute trades.
   */
   async function stopEngineSafely(userId, reason) {
   if (
@@ -262,17 +286,41 @@ DerivAccount.findOne({
 
 ]);
 
+const engineRunning = isEngineRunning(userId);
+
+/**
+
+* Database state controls whether trading is authorized to run.
+*
+* engineRunning only reports the local scheduler state.
+  */
+  const tradingActive =
+  settings.autoTradingEnabled === true &&
+  engineRunning === true;
+
 return res.status(200).json({
 success: true,
 data: {
 settings: serializeSettings(settings),
 
 
+  engine: {
+    running: engineRunning,
+    active: tradingActive,
+
+    /**
+     * Useful for diagnosing deployment restarts or scheduler
+     * failures without allowing the frontend to override safety.
+     */
+    stateMismatch:
+      settings.autoTradingEnabled === true &&
+      engineRunning === false,
+  },
+
   account: account
     ? {
         accountId: account.derivAccountId,
-        derivAccountId:
-          account.derivAccountId,
+        derivAccountId: account.derivAccountId,
 
         accountType: account.accountType,
         currency: account.currency,
@@ -303,17 +351,8 @@ settings: serializeSettings(settings),
 POST /trading/authorize-real
 ============================================================ */
 
-/**
-
-* Emergency Stop does NOT revoke an existing real-money
-* authorization. Authorization is a separate user consent state.
-*
-* This endpoint therefore remains available even if Emergency Stop
-* is active. Emergency Stop still prevents actual trade execution
-* until explicitly released.
-  */
-  export async function authorizeReal(req, res) {
-  const userId = getUserId(req);
+export async function authorizeReal(req, res) {
+const userId = getUserId(req);
 
 const confirmation =
 typeof req.body?.confirmation === "string"
@@ -378,6 +417,7 @@ export async function start(req, res) {
 const userId = getUserId(req);
 
 const settings = await getSettings(userId);
+const engineRunning = isEngineRunning(userId);
 
 if (!settings.realTradingAuthorized) {
 throw new AppError(
@@ -387,19 +427,13 @@ throw new AppError(
 );
 }
 
-/**
-
-* Emergency Stop blocks START only while it is enabled.
-* Once releaseEmergencyStop() clears the flag, Start works
-* normally without requiring a new authorization.
-  */
-  if (settings.emergencyStop === true) {
-  throw new AppError(
-  "Trading cannot start while Emergency Stop is active. Release Emergency Stop first.",
-  409,
-  "EMERGENCY_STOP_ACTIVE"
-  );
-  }
+if (settings.emergencyStop === true) {
+throw new AppError(
+"Trading cannot start while Emergency Stop is active. Release Emergency Stop first.",
+409,
+"EMERGENCY_STOP_ACTIVE"
+);
+}
 
 const account =
 await getSelectedRealAccountOrThrow(userId);
@@ -408,11 +442,11 @@ await validateSelectedMarketOrThrow(settings);
 
 /**
 
-* If a scheduler is already active, don't create another one.
+* Already healthy and running.
   */
   if (
-  settings.autoTradingEnabled &&
-  autoTradingService?.isRunning?.(userId)
+  settings.autoTradingEnabled === true &&
+  engineRunning
   ) {
   return res.status(200).json({
   success: true,
@@ -424,8 +458,10 @@ await validateSelectedMarketOrThrow(settings);
 
 /**
 
-* Enable the persistent execution flag before starting the engine.
-* Every cycle independently verifies this state.
+* Database says trading is enabled but the engine disappeared.
+* This can happen after a server restart.
+*
+* We allow the explicit Start request to recover the scheduler.
   */
   settings.autoTradingEnabled = true;
   settings.stopReason = null;
@@ -453,7 +489,7 @@ if (
 ) {
   throw new Error(
     engineResult?.reason ||
-    "The trading engine could not start"
+      "The trading engine could not start"
   );
 }
 
@@ -462,7 +498,7 @@ if (
 /**
 * Roll back only the start operation.
 *
-* Do NOT modify emergencyStop or authorization here.
+* Never change emergencyStop or real-money authorization here.
 */
 settings.autoTradingEnabled = false;
 settings.stopReason = "ENGINE_START_FAILED";
@@ -485,7 +521,7 @@ await logActivitySafe({
 
 throw new AppError(
   error?.message ||
-  "Unable to start the auto-trading engine",
+    "Unable to start the auto-trading engine",
   500,
   "AUTO_TRADING_START_FAILED"
 );
@@ -520,13 +556,39 @@ export async function stop(req, res) {
 const userId = getUserId(req);
 
 const settings = await getSettings(userId);
+const engineRunning = isEngineRunning(userId);
 
 /**
 
-* Normal Stop does not activate Emergency Stop.
+* This is the important fix.
+*
+* If the persistent trading state is already disabled AND no
+* engine is running, there is nothing to stop.
+*
+* The frontend can now receive a 409 response and keep its Stop
+* button disabled when trading is not active.
+  */
+  if (
+  settings.autoTradingEnabled !== true &&
+  engineRunning !== true
+  ) {
+  throw new AppError(
+  "Auto-trading is already stopped",
+  409,
+  "AUTO_TRADING_ALREADY_STOPPED"
+  );
+  }
+
+/**
+
+* Persist the safety state FIRST.
+*
+* Any active trading cycle must read this state before executing
+* a new trade.
   */
   settings.autoTradingEnabled = false;
   settings.stopReason = "USER_REQUESTED_STOP";
+  settings.stoppedAt = new Date();
 
 await settings.save();
 
@@ -543,14 +605,18 @@ description:
 "User stopped automatic trading.",
 metadata: {
 engineStopped,
+wasEngineRunning: engineRunning,
 },
 });
 
 return res.status(200).json({
 success: true,
 message:
-"Auto-trading has been disabled. New automated trades are blocked.",
-data: serializeSettings(settings),
+"Auto-trading has been stopped. New automated trades are blocked.",
+data: {
+...serializeSettings(settings),
+engineStopped,
+},
 });
 }
 
@@ -558,27 +624,28 @@ data: serializeSettings(settings),
 POST /trading/emergency-stop
 ============================================================ */
 
-/**
-
-* Emergency Stop is an immediate execution block.
-*
-* It is active only while settings.emergencyStop === true.
-* It does NOT revoke realTradingAuthorized.
-  */
-  export async function emergency(req, res) {
-  const userId = getUserId(req);
+export async function emergency(req, res) {
+const userId = getUserId(req);
 
 const settings = await getSettings(userId);
 
 /**
 
-* Persist the block first so every active or future cycle can
-* independently refuse execution.
+* Emergency Stop is intentionally idempotent.
+*
+* A safety control should remain safe even when clicked more
+* than once. It always persists the execution block.
   */
-  settings.autoTradingEnabled = false;
-  settings.emergencyStop = true;
-  settings.stopReason = "EMERGENCY_STOP";
-  settings.emergencyStoppedAt = new Date();
+  const wasAlreadyActive =
+  settings.emergencyStop === true;
+
+settings.autoTradingEnabled = false;
+settings.emergencyStop = true;
+settings.stopReason = "EMERGENCY_STOP";
+
+if (!wasAlreadyActive) {
+settings.emergencyStoppedAt = new Date();
+}
 
 await settings.save();
 
@@ -587,6 +654,7 @@ userId,
 "EMERGENCY_STOP"
 );
 
+if (!wasAlreadyActive) {
 await logActivitySafe({
 userId,
 type: "EMERGENCY_STOP",
@@ -597,12 +665,21 @@ metadata: {
 engineStopped,
 },
 });
+}
 
 return res.status(200).json({
 success: true,
-message:
-"Emergency Stop is active. Automatic trading is blocked until Emergency Stop is explicitly released.",
-data: serializeSettings(settings),
+message: wasAlreadyActive
+? "Emergency Stop is already active. Automatic trading remains blocked."
+: "Emergency Stop is active. Automatic trading is blocked until it is explicitly released.",
+
+
+data: {
+  ...serializeSettings(settings),
+  engineStopped,
+},
+
+
 });
 }
 
@@ -628,10 +705,8 @@ data: serializeSettings(settings),
 
 /**
 
-* Verify that the account is still valid.
-*
-* This does not start the scheduler and does not change
-* realTradingAuthorized.
+* Verify the account before allowing the emergency state to be
+* released. This still does NOT start the scheduler.
   */
   await getSelectedRealAccountOrThrow(userId);
 
@@ -671,7 +746,10 @@ req.query.limit
 
 const limit = Number.isFinite(requestedLimit)
 ? Math.min(
-Math.max(Math.floor(requestedLimit), 1),
+Math.max(
+Math.floor(requestedLimit),
+1
+),
 100
 )
 : 50;
